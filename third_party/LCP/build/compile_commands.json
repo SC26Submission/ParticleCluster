@@ -1,0 +1,26 @@
+[
+{
+  "directory": "/global/homes/c/crren/LCP/build/tools/sz3",
+  "command": "/opt/cray/pe/craype/2.7.35/bin/CC -DENABLE_GSL=\\\"TRUE\\\" -DSZ3_DEBUG_TIMINGS=0 -I/global/homes/c/crren/LCP/include -I/global/homes/c/crren/LCP/build/include -O3 -DNDEBUG -fopenmp -o CMakeFiles/lcp.dir/lcp.cpp.o -c /global/homes/c/crren/LCP/tools/sz3/lcp.cpp",
+  "file": "/global/homes/c/crren/LCP/tools/sz3/lcp.cpp",
+  "output": "tools/sz3/CMakeFiles/lcp.dir/lcp.cpp.o"
+},
+{
+  "directory": "/global/homes/c/crren/LCP/build/tools/sz3",
+  "command": "/opt/cray/pe/craype/2.7.35/bin/CC -DENABLE_GSL=\\\"TRUE\\\" -DSZ3_DEBUG_TIMINGS=0 -I/global/homes/c/crren/LCP/include -I/global/homes/c/crren/LCP/build/include -O3 -DNDEBUG -fopenmp -o CMakeFiles/sz3.dir/sz3.cpp.o -c /global/homes/c/crren/LCP/tools/sz3/sz3.cpp",
+  "file": "/global/homes/c/crren/LCP/tools/sz3/sz3.cpp",
+  "output": "tools/sz3/CMakeFiles/sz3.dir/sz3.cpp.o"
+},
+{
+  "directory": "/global/homes/c/crren/LCP/build/tools/sz3",
+  "command": "/opt/cray/pe/craype/2.7.35/bin/CC -DENABLE_GSL=\\\"TRUE\\\" -DSZ3_DEBUG_TIMINGS=0 -I/global/homes/c/crren/LCP/include -I/global/homes/c/crren/LCP/build/include -O3 -DNDEBUG -fopenmp -o CMakeFiles/sz3_smoke_test.dir/sz3_smoke_test.cpp.o -c /global/homes/c/crren/LCP/tools/sz3/sz3_smoke_test.cpp",
+  "file": "/global/homes/c/crren/LCP/tools/sz3/sz3_smoke_test.cpp",
+  "output": "tools/sz3/CMakeFiles/sz3_smoke_test.dir/sz3_smoke_test.cpp.o"
+},
+{
+  "directory": "/global/homes/c/crren/LCP/build/tools/sz3c",
+  "command": "/opt/cray/pe/craype/2.7.35/bin/CC -DENABLE_GSL=\\\"TRUE\\\" -DSZ3_DEBUG_TIMINGS=0 -DSZ3c_EXPORTS -I/global/homes/c/crren/LCP/tools/sz3c/include -I/global/homes/c/crren/LCP/include -I/global/homes/c/crren/LCP/build/include -O3 -DNDEBUG -fPIC -fopenmp -o CMakeFiles/SZ3c.dir/src/sz3c.cpp.o -c /global/homes/c/crren/LCP/tools/sz3c/src/sz3c.cpp",
+  "file": "/global/homes/c/crren/LCP/tools/sz3c/src/sz3c.cpp",
+  "output": "tools/sz3c/CMakeFiles/SZ3c.dir/src/sz3c.cpp.o"
+}
+]

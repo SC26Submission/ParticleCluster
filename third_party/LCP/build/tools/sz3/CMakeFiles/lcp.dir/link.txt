@@ -1,0 +1,1 @@
+/opt/cray/pe/craype/2.7.35/bin/CC -O3 -DNDEBUG CMakeFiles/lcp.dir/lcp.cpp.o -o lcp  /opt/cray/pe/libsci/25.09.0/GNU/12.3/x86_64/lib/libsci_gnu_mpi_mp.so /opt/cray/pe/libsci/25.09.0/GNU/12.3/x86_64/lib/libsci_gnu_mp.so /usr/lib64/gcc/x86_64-suse-linux/14/libgomp.so /usr/lib64/libzstd.so /usr/lib64/libgsl.so /usr/lib64/libgslcblas.so 
