@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --constraint=cpu
+#SBATCH --constraint=gpu
 #SBATCH --nodes=1
-#SBATCH --exclusive
+#SBATCH --gpus=1
 #SBATCH --time=00:10:00
 #SBATCH -A <YOUR_NERSC_ACCOUNT>       # FIXME: REPLACE WITH YOUR NERSC ALLOCATION
 #SBATCH -q regular                    # Use 'debug' for faster queue times if testing
@@ -25,36 +25,36 @@ SCRIPT_DIR="$SLURM_SUBMIT_DIR"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 datasets=("FPM_mid")
-# datasets=("HACC_mid" "EXAALT_MD" "EXAALT_Copper" "EXAALT_Helium" "FPM_high" "FPM_mid" "FPM_low")
+# datasets=("HACC_low" "EXAALT" "FPM_high" "FPM_mid" "FPM_low")
 error_bounds=(1e-2 5e-3 1e-3 5e-4 1e-4 5e-5 1e-5 1e-6 1e-7 1e-8 1e-9)
 # quant_lengths=(2 4 6 8 10 12 14 16 18 20 22 24 26 28)
 quant_lengths=(8 26)
 
 while getopts ":p" opt; do
-  case $opt in
-    p)
-      plot=true
-      ;;
-    \?)
-      echo "Unknown option: -$OPTARG" >&2
-      exit 1
-      ;;
-  esac
+	case $opt in
+	p)
+		plot=true
+		;;
+	\?)
+		echo "Unknown option: -$OPTARG" >&2
+		exit 1
+		;;
+	esac
 done
 
 shift $((OPTIND - 1))
 
 for i in "${!datasets[@]}"; do
-    # for epsilon in "${error_bounds[@]}"; do
-    #     echo "base: SZ3, data: ${datasets[$i]}, error bound: $epsilon"
-    #     bash "$SCRIPT_DIR/run_fofpz.sh" -d ${datasets[$i]} -c sz3 -eps $epsilon
-    #     echo "base: ZFP, data: ${datasets[$i]}, error bound: $epsilon"
-    #     bash "$SCRIPT_DIR/run_fofpz.sh" -d ${datasets[$i]} -c zfp -eps $epsilon
-    #     echo "base: LCP, data: ${datasets[$i]}, error bound: $epsilon"
-    #     bash "$SCRIPT_DIR/run_fofpz.sh" -d ${datasets[$i]} -c lcp -eps $epsilon
-    # done
-    for quant_len in "${quant_lengths[@]}"; do
-        echo "base: Draco, data: ${datasets[$i]}, quant length: $quant_len"
-        bash "$SCRIPT_DIR/run_fofpz.sh" -d ${datasets[$i]} -c draco -qp $quant_len
-    done
+	# for epsilon in "${error_bounds[@]}"; do
+	#     echo "base: SZ3, data: ${datasets[$i]}, error bound: $epsilon"
+	#     bash "$SCRIPT_DIR/run_fofpz.sh" -d ${datasets[$i]} -c sz3 -eps $epsilon
+	#     echo "base: ZFP, data: ${datasets[$i]}, error bound: $epsilon"
+	#     bash "$SCRIPT_DIR/run_fofpz.sh" -d ${datasets[$i]} -c zfp -eps $epsilon
+	#     echo "base: LCP, data: ${datasets[$i]}, error bound: $epsilon"
+	#     bash "$SCRIPT_DIR/run_fofpz.sh" -d ${datasets[$i]} -c lcp -eps $epsilon
+	# done
+	for quant_len in "${quant_lengths[@]}"; do
+		echo "base: Draco, data: ${datasets[$i]}, quant length: $quant_len"
+		bash "$SCRIPT_DIR/run_fofpz.sh" -d ${datasets[$i]} -c draco -qp $quant_len
+	done
 done
