@@ -20,8 +20,31 @@ bool isDouble;
 bool isABS;
 bool isEdit = true;
 OrderMode mode = OrderMode::MORTON_CODE;
+FoFConstraintStrategy fof_constraint_strategy =
+    FoFConstraintStrategy::PAIRWISE_VULNERABILITY;
 int max_iter = 1000;
 double lr = 0.01;
+int target_cell_occupancy = 0; // 0 means default: 8 in 2D, 4 in 3D
+
+void parseError(const char error[]);
+
+FoFConstraintStrategy parseFoFConstraintStrategy(const std::string &value) {
+  if (value == "1" || value == "pairwise" ||
+      value == "pairwise-vulnerability") {
+    return FoFConstraintStrategy::PAIRWISE_VULNERABILITY;
+  }
+  if (value == "2" || value == "safe-filter" ||
+      value == "safe-component-filtering") {
+    return FoFConstraintStrategy::SAFE_COMPONENT_FILTERING;
+  }
+  if (value == "3" || value == "contracted-forest" ||
+      value == "contracted-halo-forest") {
+    return FoFConstraintStrategy::CONTRACTED_HALO_FOREST;
+  }
+  parseError("FoF constraint strategy must be 1/pairwise-vulnerability, "
+             "2/safe-component-filtering, or 3/contracted-halo-forest");
+  return FoFConstraintStrategy::PAIRWISE_VULNERABILITY;
+}
 
 void parseError(const char error[]) {
   fprintf(stderr, "%s\n", error);
@@ -38,6 +61,12 @@ void parseError(const char error[]) {
   fprintf(stderr, "  -B <d>           : Linking length parameter\n");
   fprintf(stderr, "  -KD              : k-d tree reordering\n");
   fprintf(stderr, "  -MC              : Morton code reordering\n");
+  fprintf(stderr,
+          "  -CS <strategy>   : FoF constraint strategy: "
+          "1/pairwise-vulnerability, 2/safe-component-filtering, "
+          "3/contracted-halo-forest\n");
+  fprintf(stderr, "  -occ <n>         : Target particles per grid cell "
+                  "(default: 8 in 2D, 4 in 3D)\n");
   fprintf(stderr, "  -lr              : PGD learning rate\n");
   fprintf(stderr, "  -iter            : PGD max iterations\n");
   fprintf(stderr, "  -c               : Compression only\n");
@@ -94,10 +123,20 @@ void Parsing(int argc, char *argv[]) {
       mode = OrderMode::KD_TREE;
     } else if (arg == "-MC") {
       mode = OrderMode::MORTON_CODE;
+    } else if (arg == "-CS" || arg == "-cs") {
+      if (i + 1 >= argc)
+        parseError("Missing FoF constraint strategy");
+      fof_constraint_strategy = parseFoFConstraintStrategy(argv[++i]);
     } else if (arg == "-lr") {
       lr = std::stof(argv[++i]);
     } else if (arg == "-iter") {
       max_iter = std::stoi(argv[++i]);
+    } else if (arg == "-occ") {
+      if (i + 1 >= argc)
+        parseError("Missing target cell occupancy");
+      target_cell_occupancy = std::stoi(argv[++i]);
+      if (target_cell_occupancy <= 0)
+        parseError("Target cell occupancy must be positive");
     } else if (arg == "-c") {
       isEdit = false;
     } else {

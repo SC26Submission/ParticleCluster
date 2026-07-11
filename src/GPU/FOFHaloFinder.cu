@@ -1,5 +1,152 @@
 #include "FOFHaloFinder.cuh"
-#include "particle_compression.cuh"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <limits>
+
+extern int target_cell_occupancy;
+
+namespace {
+
+static int maxCellsForTargetOccupancy(int N, int default_occupancy) {
+  int occupancy =
+      target_cell_occupancy > 0 ? target_cell_occupancy : default_occupancy;
+  long long max_cells = (static_cast<long long>(N) + occupancy - 1) / occupancy;
+  if (max_cells > static_cast<long long>(std::numeric_limits<int>::max()))
+    return std::numeric_limits<int>::max();
+  return std::max(1, static_cast<int>(max_cells));
+}
+
+template <typename T> static int gridDimForRange(T range, T grid_len) {
+  if (range <= T(0))
+    return 1;
+  return std::max(1, static_cast<int>(std::ceil(range / grid_len)));
+}
+
+template <typename T>
+static long long cellCount2D(T range_x, T range_y, T grid_len, int &dim_x,
+                             int &dim_y) {
+  dim_x = gridDimForRange(range_x, grid_len);
+  dim_y = gridDimForRange(range_y, grid_len);
+  return static_cast<long long>(dim_x) * dim_y;
+}
+
+template <typename T>
+static long long cellCount3D(T range_x, T range_y, T range_z, T grid_len,
+                             int &dim_x, int &dim_y, int &dim_z) {
+  dim_x = gridDimForRange(range_x, grid_len);
+  dim_y = gridDimForRange(range_y, grid_len);
+  dim_z = gridDimForRange(range_z, grid_len);
+  return static_cast<long long>(dim_x) * dim_y * dim_z;
+}
+
+template <typename T>
+static void coarsenFoFGrid2D(T &grid_len, int &grid_dim_x, int &grid_dim_y,
+                             T range_x, T range_y, int max_cells) {
+  long long nc = static_cast<long long>(grid_dim_x) * grid_dim_y;
+  if (nc <= max_cells)
+    return;
+
+  T original_grid_len = grid_len;
+  T scale = std::sqrt(static_cast<T>(nc) / static_cast<T>(max_cells));
+  T low = original_grid_len;
+  T high = original_grid_len * scale;
+  int dim_x = grid_dim_x;
+  int dim_y = grid_dim_y;
+  long long nc_new = cellCount2D(range_x, range_y, high, dim_x, dim_y);
+
+  while (nc_new > max_cells) {
+    low = high;
+    high *= static_cast<T>(2);
+    nc_new = cellCount2D(range_x, range_y, high, dim_x, dim_y);
+  }
+
+  for (int iter = 0; iter < 32; ++iter) {
+    T mid = (low + high) * static_cast<T>(0.5);
+    int mid_x, mid_y;
+    long long mid_cells = cellCount2D(range_x, range_y, mid, mid_x, mid_y);
+    if (mid_cells <= max_cells) {
+      high = mid;
+      dim_x = mid_x;
+      dim_y = mid_y;
+      nc_new = mid_cells;
+    } else {
+      low = mid;
+    }
+  }
+
+  grid_len = high;
+  grid_dim_x = dim_x;
+  grid_dim_y = dim_y;
+  std::printf("FoF grid coarsened: %lld -> %lld cells (grid_len %e, factor "
+              "%.2fx)\n",
+              nc, nc_new, static_cast<double>(grid_len),
+              static_cast<double>(grid_len / original_grid_len));
+}
+
+template <typename T>
+static void coarsenFoFGrid3D(T &grid_len, int &grid_dim_x, int &grid_dim_y,
+                             int &grid_dim_z, T range_x, T range_y, T range_z,
+                             int max_cells) {
+  long long nc =
+      static_cast<long long>(grid_dim_x) * grid_dim_y * grid_dim_z;
+  if (nc <= max_cells)
+    return;
+
+  T original_grid_len = grid_len;
+  T scale = std::cbrt(static_cast<T>(nc) / static_cast<T>(max_cells));
+  T low = original_grid_len;
+  T high = original_grid_len * scale;
+  int dim_x = grid_dim_x;
+  int dim_y = grid_dim_y;
+  int dim_z = grid_dim_z;
+  long long nc_new =
+      cellCount3D(range_x, range_y, range_z, high, dim_x, dim_y, dim_z);
+
+  while (nc_new > max_cells) {
+    low = high;
+    high *= static_cast<T>(2);
+    nc_new = cellCount3D(range_x, range_y, range_z, high, dim_x, dim_y, dim_z);
+  }
+
+  for (int iter = 0; iter < 32; ++iter) {
+    T mid = (low + high) * static_cast<T>(0.5);
+    int mid_x, mid_y, mid_z;
+    long long mid_cells =
+        cellCount3D(range_x, range_y, range_z, mid, mid_x, mid_y, mid_z);
+    if (mid_cells <= max_cells) {
+      high = mid;
+      dim_x = mid_x;
+      dim_y = mid_y;
+      dim_z = mid_z;
+      nc_new = mid_cells;
+    } else {
+      low = mid;
+    }
+  }
+
+  grid_len = high;
+  grid_dim_x = dim_x;
+  grid_dim_y = dim_y;
+  grid_dim_z = dim_z;
+  std::printf("FoF grid coarsened: %lld -> %lld cells (grid_len %e, factor "
+              "%.2fx)\n",
+              nc, nc_new, static_cast<double>(grid_len),
+              static_cast<double>(grid_len / original_grid_len));
+}
+
+static int checkedCellCount(long long cell_count, const char *context) {
+  if (cell_count <= 0 ||
+      cell_count > static_cast<long long>(std::numeric_limits<int>::max())) {
+    std::fprintf(stderr, "%s cell count %lld exceeds int range\n", context,
+                 cell_count);
+    std::exit(EXIT_FAILURE);
+  }
+  return static_cast<int>(cell_count);
+}
+
+} // namespace
 
 // Initialize Union-Find: each particle is its own parent
 __global__ void initUnionFind_kernel(int *parent, int *rank, int N) {
@@ -15,27 +162,6 @@ __global__ void flattenRoots_kernel(int *parent, int *roots, int N) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < N) {
     roots[idx] = find_uf(parent, idx);
-  }
-}
-
-// Compute C(n,2) = n*(n-1)/2 for each count in an array, store as long long
-__global__ void chooseTwo_kernel(const int *counts, long long *results,
-                                 int num_entries) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < num_entries) {
-    long long n = counts[idx];
-    results[idx] = n * (n - 1) / 2;
-  }
-}
-
-// Pack two int32 roots into one int64 key for contingency table
-__global__ void packPairKeys_kernel(const int *org_roots,
-                                    const int *decomp_roots, long long *keys,
-                                    int N) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < N) {
-    keys[idx] = ((long long)(unsigned int)org_roots[idx] << 32) |
-                (unsigned int)decomp_roots[idx];
   }
 }
 
@@ -207,437 +333,112 @@ buildHalos3D_kernel(const T *d_xx, const T *d_yy, const T *d_zz,
   }
 }
 
-// ============================================================================
-// CONTINGENCY-TABLE ARI: O(N log N)
-// ============================================================================
-
-// After building union-find for both partitions, compute TP/TN/FP/FN via:
-//   TP = sum_ij C(n_ij, 2)
-//   TP + FN = sum_i C(a_i, 2)   (a_i = row sums = org cluster sizes)
-//   TP + FP = sum_j C(b_j, 2)   (b_j = col sums = decomp cluster sizes)
-//   TP + FP + FN + TN = C(N, 2)
-
-static void computeTPTNFPFN(UnionFind &org_uf, UnionFind &decomp_uf, int N,
-                             long long &h_tp, long long &h_tn, long long &h_fp,
-                             long long &h_fn) {
-  int blocks = (N + num_threads - 1) / num_threads;
-
-  // Step 1: flatten roots
-  int *d_org_roots, *d_decomp_roots;
-  CUDA_CHECK(cudaMalloc(&d_org_roots, N * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_decomp_roots, N * sizeof(int)));
-  flattenRoots_kernel<<<blocks, num_threads>>>(org_uf.parent, d_org_roots, N);
-  flattenRoots_kernel<<<blocks, num_threads>>>(decomp_uf.parent, d_decomp_roots,
-                                               N);
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  // Step 2: compute sum_i C(a_i, 2) — org cluster sizes
-  // Sort org roots, run-length encode to get cluster sizes
-  int *d_org_sorted;
-  CUDA_CHECK(cudaMalloc(&d_org_sorted, N * sizeof(int)));
-  {
-    void *d_tmp = nullptr;
-    size_t tmp_bytes = 0;
-    cub::DeviceRadixSort::SortKeys(d_tmp, tmp_bytes, d_org_roots, d_org_sorted,
-                                   N);
-    CUDA_CHECK(cudaMalloc(&d_tmp, tmp_bytes));
-    cub::DeviceRadixSort::SortKeys(d_tmp, tmp_bytes, d_org_roots, d_org_sorted,
-                                   N);
-    CUDA_CHECK(cudaFree(d_tmp));
-  }
-
-  int *d_org_unique, *d_org_counts, *d_num_org_clusters;
-  CUDA_CHECK(cudaMalloc(&d_org_unique, N * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_org_counts, N * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_num_org_clusters, sizeof(int)));
-  {
-    void *d_tmp = nullptr;
-    size_t tmp_bytes = 0;
-    cub::DeviceRunLengthEncode::Encode(d_tmp, tmp_bytes, d_org_sorted,
-                                       d_org_unique, d_org_counts,
-                                       d_num_org_clusters, N);
-    CUDA_CHECK(cudaMalloc(&d_tmp, tmp_bytes));
-    cub::DeviceRunLengthEncode::Encode(d_tmp, tmp_bytes, d_org_sorted,
-                                       d_org_unique, d_org_counts,
-                                       d_num_org_clusters, N);
-    CUDA_CHECK(cudaFree(d_tmp));
-  }
-
-  int h_num_org_clusters;
-  CUDA_CHECK(cudaMemcpy(&h_num_org_clusters, d_num_org_clusters, sizeof(int),
-                         cudaMemcpyDeviceToHost));
-
-  // C(a_i, 2) for each cluster, then sum
-  long long *d_org_c2;
-  CUDA_CHECK(cudaMalloc(&d_org_c2, h_num_org_clusters * sizeof(long long)));
-  int c2_blocks = (h_num_org_clusters + num_threads - 1) / num_threads;
-  chooseTwo_kernel<<<c2_blocks, num_threads>>>(d_org_counts, d_org_c2,
-                                               h_num_org_clusters);
-
-  long long *d_sum_org_c2;
-  CUDA_CHECK(cudaMalloc(&d_sum_org_c2, sizeof(long long)));
-  {
-    void *d_tmp = nullptr;
-    size_t tmp_bytes = 0;
-    cub::DeviceReduce::Sum(d_tmp, tmp_bytes, d_org_c2, d_sum_org_c2,
-                           h_num_org_clusters);
-    CUDA_CHECK(cudaMalloc(&d_tmp, tmp_bytes));
-    cub::DeviceReduce::Sum(d_tmp, tmp_bytes, d_org_c2, d_sum_org_c2,
-                           h_num_org_clusters);
-    CUDA_CHECK(cudaFree(d_tmp));
-  }
-
-  long long h_sum_org_c2; // = TP + FN
-  CUDA_CHECK(cudaMemcpy(&h_sum_org_c2, d_sum_org_c2, sizeof(long long),
-                         cudaMemcpyDeviceToHost));
-
-  CUDA_CHECK(cudaFree(d_org_c2));
-  CUDA_CHECK(cudaFree(d_sum_org_c2));
-  CUDA_CHECK(cudaFree(d_org_unique));
-  CUDA_CHECK(cudaFree(d_org_counts));
-  CUDA_CHECK(cudaFree(d_num_org_clusters));
-  CUDA_CHECK(cudaFree(d_org_sorted));
-
-  // Step 3: compute sum_j C(b_j, 2) — decomp cluster sizes
-  int *d_decomp_sorted;
-  CUDA_CHECK(cudaMalloc(&d_decomp_sorted, N * sizeof(int)));
-  {
-    void *d_tmp = nullptr;
-    size_t tmp_bytes = 0;
-    cub::DeviceRadixSort::SortKeys(d_tmp, tmp_bytes, d_decomp_roots,
-                                   d_decomp_sorted, N);
-    CUDA_CHECK(cudaMalloc(&d_tmp, tmp_bytes));
-    cub::DeviceRadixSort::SortKeys(d_tmp, tmp_bytes, d_decomp_roots,
-                                   d_decomp_sorted, N);
-    CUDA_CHECK(cudaFree(d_tmp));
-  }
-
-  int *d_decomp_unique, *d_decomp_counts, *d_num_decomp_clusters;
-  CUDA_CHECK(cudaMalloc(&d_decomp_unique, N * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_decomp_counts, N * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_num_decomp_clusters, sizeof(int)));
-  {
-    void *d_tmp = nullptr;
-    size_t tmp_bytes = 0;
-    cub::DeviceRunLengthEncode::Encode(d_tmp, tmp_bytes, d_decomp_sorted,
-                                       d_decomp_unique, d_decomp_counts,
-                                       d_num_decomp_clusters, N);
-    CUDA_CHECK(cudaMalloc(&d_tmp, tmp_bytes));
-    cub::DeviceRunLengthEncode::Encode(d_tmp, tmp_bytes, d_decomp_sorted,
-                                       d_decomp_unique, d_decomp_counts,
-                                       d_num_decomp_clusters, N);
-    CUDA_CHECK(cudaFree(d_tmp));
-  }
-
-  int h_num_decomp_clusters;
-  CUDA_CHECK(cudaMemcpy(&h_num_decomp_clusters, d_num_decomp_clusters,
-                         sizeof(int), cudaMemcpyDeviceToHost));
-
-  long long *d_decomp_c2;
-  CUDA_CHECK(
-      cudaMalloc(&d_decomp_c2, h_num_decomp_clusters * sizeof(long long)));
-  c2_blocks = (h_num_decomp_clusters + num_threads - 1) / num_threads;
-  chooseTwo_kernel<<<c2_blocks, num_threads>>>(d_decomp_counts, d_decomp_c2,
-                                               h_num_decomp_clusters);
-
-  long long *d_sum_decomp_c2;
-  CUDA_CHECK(cudaMalloc(&d_sum_decomp_c2, sizeof(long long)));
-  {
-    void *d_tmp = nullptr;
-    size_t tmp_bytes = 0;
-    cub::DeviceReduce::Sum(d_tmp, tmp_bytes, d_decomp_c2, d_sum_decomp_c2,
-                           h_num_decomp_clusters);
-    CUDA_CHECK(cudaMalloc(&d_tmp, tmp_bytes));
-    cub::DeviceReduce::Sum(d_tmp, tmp_bytes, d_decomp_c2, d_sum_decomp_c2,
-                           h_num_decomp_clusters);
-    CUDA_CHECK(cudaFree(d_tmp));
-  }
-
-  long long h_sum_decomp_c2; // = TP + FP
-  CUDA_CHECK(cudaMemcpy(&h_sum_decomp_c2, d_sum_decomp_c2, sizeof(long long),
-                         cudaMemcpyDeviceToHost));
-
-  CUDA_CHECK(cudaFree(d_decomp_c2));
-  CUDA_CHECK(cudaFree(d_sum_decomp_c2));
-  CUDA_CHECK(cudaFree(d_decomp_unique));
-  CUDA_CHECK(cudaFree(d_decomp_counts));
-  CUDA_CHECK(cudaFree(d_num_decomp_clusters));
-  CUDA_CHECK(cudaFree(d_decomp_sorted));
-
-  // Step 4: compute sum_ij C(n_ij, 2) — contingency table entries
-  // Encode (org_root, decomp_root) as a 64-bit key, sort, run-length encode
-  long long *d_pair_keys;
-  CUDA_CHECK(cudaMalloc(&d_pair_keys, N * sizeof(long long)));
-  packPairKeys_kernel<<<blocks, num_threads>>>(d_org_roots, d_decomp_roots,
-                                               d_pair_keys, N);
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  CUDA_CHECK(cudaFree(d_org_roots));
-  CUDA_CHECK(cudaFree(d_decomp_roots));
-
-  // Sort pair keys
-  long long *d_pair_keys_sorted;
-  CUDA_CHECK(cudaMalloc(&d_pair_keys_sorted, N * sizeof(long long)));
-  {
-    void *d_tmp = nullptr;
-    size_t tmp_bytes = 0;
-    cub::DeviceRadixSort::SortKeys(d_tmp, tmp_bytes, d_pair_keys,
-                                   d_pair_keys_sorted, N);
-    CUDA_CHECK(cudaMalloc(&d_tmp, tmp_bytes));
-    cub::DeviceRadixSort::SortKeys(d_tmp, tmp_bytes, d_pair_keys,
-                                   d_pair_keys_sorted, N);
-    CUDA_CHECK(cudaFree(d_tmp));
-  }
-  CUDA_CHECK(cudaFree(d_pair_keys));
-
-  // Run-length encode to get contingency counts
-  long long *d_pair_unique;
-  int *d_pair_counts, *d_num_pairs;
-  CUDA_CHECK(cudaMalloc(&d_pair_unique, N * sizeof(long long)));
-  CUDA_CHECK(cudaMalloc(&d_pair_counts, N * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_num_pairs, sizeof(int)));
-  {
-    void *d_tmp = nullptr;
-    size_t tmp_bytes = 0;
-    cub::DeviceRunLengthEncode::Encode(d_tmp, tmp_bytes, d_pair_keys_sorted,
-                                       d_pair_unique, d_pair_counts,
-                                       d_num_pairs, N);
-    CUDA_CHECK(cudaMalloc(&d_tmp, tmp_bytes));
-    cub::DeviceRunLengthEncode::Encode(d_tmp, tmp_bytes, d_pair_keys_sorted,
-                                       d_pair_unique, d_pair_counts,
-                                       d_num_pairs, N);
-    CUDA_CHECK(cudaFree(d_tmp));
-  }
-  CUDA_CHECK(cudaFree(d_pair_keys_sorted));
-  CUDA_CHECK(cudaFree(d_pair_unique));
-
-  int h_num_pairs;
-  CUDA_CHECK(
-      cudaMemcpy(&h_num_pairs, d_num_pairs, sizeof(int), cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaFree(d_num_pairs));
-
-  // C(n_ij, 2) for each contingency entry, then sum
-  long long *d_pair_c2;
-  CUDA_CHECK(cudaMalloc(&d_pair_c2, h_num_pairs * sizeof(long long)));
-  c2_blocks = (h_num_pairs + num_threads - 1) / num_threads;
-  chooseTwo_kernel<<<c2_blocks, num_threads>>>(d_pair_counts, d_pair_c2,
-                                               h_num_pairs);
-  CUDA_CHECK(cudaFree(d_pair_counts));
-
-  long long *d_sum_pair_c2;
-  CUDA_CHECK(cudaMalloc(&d_sum_pair_c2, sizeof(long long)));
-  {
-    void *d_tmp = nullptr;
-    size_t tmp_bytes = 0;
-    cub::DeviceReduce::Sum(d_tmp, tmp_bytes, d_pair_c2, d_sum_pair_c2,
-                           h_num_pairs);
-    CUDA_CHECK(cudaMalloc(&d_tmp, tmp_bytes));
-    cub::DeviceReduce::Sum(d_tmp, tmp_bytes, d_pair_c2, d_sum_pair_c2,
-                           h_num_pairs);
-    CUDA_CHECK(cudaFree(d_tmp));
-  }
-
-  long long h_sum_pair_c2; // = TP
-  CUDA_CHECK(cudaMemcpy(&h_sum_pair_c2, d_sum_pair_c2, sizeof(long long),
-                         cudaMemcpyDeviceToHost));
-
-  CUDA_CHECK(cudaFree(d_pair_c2));
-  CUDA_CHECK(cudaFree(d_sum_pair_c2));
-
-  // Step 5: derive TP, FP, FN, TN
-  long long total_pairs = (long long)N * (N - 1) / 2;
-  h_tp = h_sum_pair_c2;
-  h_fn = h_sum_org_c2 - h_tp;
-  h_fp = h_sum_decomp_c2 - h_tp;
-  h_tn = total_pairs - h_tp - h_fp - h_fn;
-}
-
-// ============================================================================
-// ARI CALCULATION FUNCTIONS
-// ============================================================================
-
 template <typename T>
-void calculateARI2D(const T *d_org_xx, const T *d_org_yy, T *d_decomp_xx,
-                    T *d_decomp_yy, T min_x, T range_x, T min_y, T range_y,
-                    int N, T b, long long &h_tp, long long &h_tn,
-                    long long &h_fp, long long &h_fn) {
-  if (N == 0) {
-    h_tp = 0;
-    h_tn = 0;
-    h_fp = 0;
-    h_fn = 0;
+void computeFoFRoots2D(const T *d_xx, const T *d_yy, T min_x, T range_x,
+                       T min_y, T range_y, int N, T b, int **d_roots_out) {
+  *d_roots_out = nullptr;
+  if (N == 0)
     return;
-  }
 
   T b_sq = b * b;
+  if (b <= T(0)) {
+    std::fprintf(stderr, "FoF linking length must be positive\n");
+    std::exit(EXIT_FAILURE);
+  }
+  T grid_len = b;
+  int grid_dim_x, grid_dim_y;
+  long long num_cells_ll =
+      cellCount2D(range_x, range_y, grid_len, grid_dim_x, grid_dim_y);
+  int max_cells = maxCellsForTargetOccupancy(N, 8);
+  coarsenFoFGrid2D(grid_len, grid_dim_x, grid_dim_y, range_x, range_y,
+                   max_cells);
+  num_cells_ll = static_cast<long long>(grid_dim_x) * grid_dim_y;
+  int num_cells = checkedCellCount(num_cells_ll, "computeFoFRoots2D");
 
-  // Partition both datasets into cells
-  int grid_dim_x = std::max(1, static_cast<int>(std::ceil(range_x / b)));
-  int grid_dim_y = std::max(1, static_cast<int>(std::ceil(range_y / b)));
-  int num_cells = grid_dim_x * grid_dim_y;
+  int *d_cell_start = nullptr;
+  int *d_cell_pts_sorted = nullptr;
+  particlePartition2D(d_xx, d_yy, min_x, min_y, grid_len, grid_dim_x,
+                      grid_dim_y, N, &d_cell_start, &d_cell_pts_sorted);
 
-  int *d_org_cell_start, *d_org_cell_pts_sorted;
-  particlePartition2D(d_org_xx, d_org_yy, min_x, min_y, b, grid_dim_x,
-                      grid_dim_y, N, &d_org_cell_start, &d_org_cell_pts_sorted);
-
-  T min_x_decomp, max_x_decomp, range_x_decomp, min_y_decomp, max_y_decomp,
-      range_y_decomp;
-  getRange(d_decomp_xx, N, min_x_decomp, max_x_decomp, range_x_decomp);
-  getRange(d_decomp_yy, N, min_y_decomp, max_y_decomp, range_y_decomp);
-
-  int grid_dim_x_decomp =
-      std::max(1, static_cast<int>(std::ceil(range_x_decomp / b)));
-  int grid_dim_y_decomp =
-      std::max(1, static_cast<int>(std::ceil(range_y_decomp / b)));
-
-  int *d_decomp_cell_start, *d_decomp_cell_pts_sorted;
-  particlePartition2D(d_decomp_xx, d_decomp_yy, min_x_decomp, min_y_decomp, b,
-                      grid_dim_x_decomp, grid_dim_y_decomp, N,
-                      &d_decomp_cell_start, &d_decomp_cell_pts_sorted);
-
-  // Build halos using union-find
-  UnionFind org_uf = createUnionFind(N);
-  UnionFind decomp_uf = createUnionFind(N);
+  UnionFind uf = createUnionFind(N);
   int init_blocks = (N + num_threads - 1) / num_threads;
-  initUnionFind_kernel<<<init_blocks, num_threads>>>(org_uf.parent, org_uf.rank,
-                                                     N);
-  initUnionFind_kernel<<<init_blocks, num_threads>>>(decomp_uf.parent,
-                                                     decomp_uf.rank, N);
-  CUDA_CHECK(cudaDeviceSynchronize());
+  initUnionFind_kernel<<<init_blocks, num_threads>>>(uf.parent, uf.rank, N);
 
   int cell_blocks = (num_cells + num_threads - 1) / num_threads;
   buildHalos2D_kernel<T><<<cell_blocks, num_threads>>>(
-      d_org_xx, d_org_yy, d_org_cell_start, d_org_cell_pts_sorted, num_cells, N,
-      min_x, min_y, b, grid_dim_x, grid_dim_y, b_sq, org_uf.parent,
-      org_uf.rank);
+      d_xx, d_yy, d_cell_start, d_cell_pts_sorted, num_cells, N, min_x, min_y,
+      b, grid_dim_x, grid_dim_y, b_sq, uf.parent, uf.rank);
 
-  int decomp_num_cells = grid_dim_x_decomp * grid_dim_y_decomp;
-  int decomp_cell_blocks = (decomp_num_cells + num_threads - 1) / num_threads;
-  buildHalos2D_kernel<T><<<decomp_cell_blocks, num_threads>>>(
-      d_decomp_xx, d_decomp_yy, d_decomp_cell_start, d_decomp_cell_pts_sorted,
-      decomp_num_cells, N, min_x_decomp, min_y_decomp, b, grid_dim_x_decomp,
-      grid_dim_y_decomp, b_sq, decomp_uf.parent, decomp_uf.rank);
-  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaMalloc(d_roots_out, N * sizeof(int)));
+  flattenRoots_kernel<<<init_blocks, num_threads>>>(uf.parent, *d_roots_out, N);
 
-  // Compute TP/TN/FP/FN via contingency table
-  computeTPTNFPFN(org_uf, decomp_uf, N, h_tp, h_tn, h_fp, h_fn);
-
-  // Cleanup
-  CUDA_CHECK(cudaFree(d_org_cell_start));
-  CUDA_CHECK(cudaFree(d_org_cell_pts_sorted));
-  CUDA_CHECK(cudaFree(d_decomp_cell_start));
-  CUDA_CHECK(cudaFree(d_decomp_cell_pts_sorted));
-  destroyUnionFind(org_uf);
-  destroyUnionFind(decomp_uf);
+  CUDA_CHECK(cudaFree(d_cell_start));
+  CUDA_CHECK(cudaFree(d_cell_pts_sorted));
+  destroyUnionFind(uf);
 }
 
 template <typename T>
-void calculateARI3D(const T *d_org_xx, const T *d_org_yy, const T *d_org_zz,
-                    T *d_decomp_xx, T *d_decomp_yy, T *d_decomp_zz, T min_x,
-                    T range_x, T min_y, T range_y, T min_z, T range_z, int N,
-                    T b, long long &h_tp, long long &h_tn, long long &h_fp,
-                    long long &h_fn) {
-  if (N == 0) {
-    h_tp = 0;
-    h_tn = 0;
-    h_fp = 0;
-    h_fn = 0;
+void computeFoFRoots3D(const T *d_xx, const T *d_yy, const T *d_zz, T min_x,
+                       T range_x, T min_y, T range_y, T min_z, T range_z, int N,
+                       T b, int **d_roots_out) {
+  *d_roots_out = nullptr;
+  if (N == 0)
     return;
-  }
 
   T b_sq = b * b;
+  if (b <= T(0)) {
+    std::fprintf(stderr, "FoF linking length must be positive\n");
+    std::exit(EXIT_FAILURE);
+  }
+  T grid_len = b;
+  int grid_dim_x, grid_dim_y, grid_dim_z;
+  long long num_cells_ll = cellCount3D(range_x, range_y, range_z, grid_len,
+                                       grid_dim_x, grid_dim_y, grid_dim_z);
+  int max_cells = maxCellsForTargetOccupancy(N, 4);
+  coarsenFoFGrid3D(grid_len, grid_dim_x, grid_dim_y, grid_dim_z, range_x,
+                   range_y, range_z, max_cells);
+  num_cells_ll =
+      static_cast<long long>(grid_dim_x) * grid_dim_y * grid_dim_z;
+  int num_cells = checkedCellCount(num_cells_ll, "computeFoFRoots3D");
 
-  // Partition both datasets into cells
-  int grid_dim_x = std::max(1, static_cast<int>(std::ceil(range_x / b)));
-  int grid_dim_y = std::max(1, static_cast<int>(std::ceil(range_y / b)));
-  int grid_dim_z = std::max(1, static_cast<int>(std::ceil(range_z / b)));
-  int num_cells = grid_dim_x * grid_dim_y * grid_dim_z;
+  int *d_cell_start = nullptr;
+  int *d_cell_pts_sorted = nullptr;
+  particlePartition3D(d_xx, d_yy, d_zz, min_x, min_y, min_z, grid_len,
+                      grid_dim_x, grid_dim_y, grid_dim_z, N, &d_cell_start,
+                      &d_cell_pts_sorted);
 
-  int *d_org_cell_start, *d_org_cell_pts_sorted;
-  particlePartition3D(d_org_xx, d_org_yy, d_org_zz, min_x, min_y, min_z, b,
-                      grid_dim_x, grid_dim_y, grid_dim_z, N, &d_org_cell_start,
-                      &d_org_cell_pts_sorted);
-
-  T min_x_decomp, min_y_decomp, min_z_decomp, max_x_decomp, max_y_decomp,
-      max_z_decomp, range_x_decomp, range_y_decomp, range_z_decomp;
-  getRange(d_decomp_xx, N, min_x_decomp, max_x_decomp, range_x_decomp);
-  getRange(d_decomp_yy, N, min_y_decomp, max_y_decomp, range_y_decomp);
-  getRange(d_decomp_zz, N, min_z_decomp, max_z_decomp, range_z_decomp);
-
-  int grid_dim_x_decomp =
-      std::max(1, static_cast<int>(std::ceil(range_x_decomp / b)));
-  int grid_dim_y_decomp =
-      std::max(1, static_cast<int>(std::ceil(range_y_decomp / b)));
-  int grid_dim_z_decomp =
-      std::max(1, static_cast<int>(std::ceil(range_z_decomp / b)));
-
-  int *d_decomp_cell_start, *d_decomp_cell_pts_sorted;
-  particlePartition3D(d_decomp_xx, d_decomp_yy, d_decomp_zz, min_x_decomp,
-                      min_y_decomp, min_z_decomp, b, grid_dim_x_decomp,
-                      grid_dim_y_decomp, grid_dim_z_decomp, N,
-                      &d_decomp_cell_start, &d_decomp_cell_pts_sorted);
-
-  // Build halos using union-find
-  UnionFind org_uf = createUnionFind(N);
-  UnionFind decomp_uf = createUnionFind(N);
+  UnionFind uf = createUnionFind(N);
   int init_blocks = (N + num_threads - 1) / num_threads;
-  initUnionFind_kernel<<<init_blocks, num_threads>>>(org_uf.parent, org_uf.rank,
-                                                     N);
-  initUnionFind_kernel<<<init_blocks, num_threads>>>(decomp_uf.parent,
-                                                     decomp_uf.rank, N);
-  CUDA_CHECK(cudaDeviceSynchronize());
+  initUnionFind_kernel<<<init_blocks, num_threads>>>(uf.parent, uf.rank, N);
 
   int cell_blocks = (num_cells + num_threads - 1) / num_threads;
   buildHalos3D_kernel<T><<<cell_blocks, num_threads>>>(
-      d_org_xx, d_org_yy, d_org_zz, d_org_cell_start, d_org_cell_pts_sorted,
-      num_cells, N, min_x, min_y, min_z, b, grid_dim_x, grid_dim_y, grid_dim_z,
-      b_sq, org_uf.parent, org_uf.rank);
+      d_xx, d_yy, d_zz, d_cell_start, d_cell_pts_sorted, num_cells, N, min_x,
+      min_y, min_z, b, grid_dim_x, grid_dim_y, grid_dim_z, b_sq, uf.parent,
+      uf.rank);
 
-  int decomp_num_cells =
-      grid_dim_x_decomp * grid_dim_y_decomp * grid_dim_z_decomp;
-  int decomp_cell_blocks = (decomp_num_cells + num_threads - 1) / num_threads;
-  buildHalos3D_kernel<T><<<decomp_cell_blocks, num_threads>>>(
-      d_decomp_xx, d_decomp_yy, d_decomp_zz, d_decomp_cell_start,
-      d_decomp_cell_pts_sorted, decomp_num_cells, N, min_x_decomp, min_y_decomp,
-      min_z_decomp, b, grid_dim_x_decomp, grid_dim_y_decomp, grid_dim_z_decomp,
-      b_sq, decomp_uf.parent, decomp_uf.rank);
-  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaMalloc(d_roots_out, N * sizeof(int)));
+  flattenRoots_kernel<<<init_blocks, num_threads>>>(uf.parent, *d_roots_out, N);
 
-  // Compute TP/TN/FP/FN via contingency table
-  computeTPTNFPFN(org_uf, decomp_uf, N, h_tp, h_tn, h_fp, h_fn);
-
-  // Cleanup
-  CUDA_CHECK(cudaFree(d_org_cell_start));
-  CUDA_CHECK(cudaFree(d_org_cell_pts_sorted));
-  CUDA_CHECK(cudaFree(d_decomp_cell_start));
-  CUDA_CHECK(cudaFree(d_decomp_cell_pts_sorted));
-  destroyUnionFind(org_uf);
-  destroyUnionFind(decomp_uf);
+  CUDA_CHECK(cudaFree(d_cell_start));
+  CUDA_CHECK(cudaFree(d_cell_pts_sorted));
+  destroyUnionFind(uf);
 }
 
-// ============================================================================
-// EXPLICIT TEMPLATE INSTANTIATIONS
-// ============================================================================
+// Explicit template instantiations
+template void computeFoFRoots2D<float>(const float *, const float *, float,
+                                       float, float, float, int, float, int **);
+template void computeFoFRoots2D<double>(const double *, const double *, double,
+                                        double, double, double, int, double,
+                                        int **);
 
-template void calculateARI2D<float>(const float *, const float *, float *,
-                                    float *, float, float, float, float, int,
-                                    float, long long &, long long &,
-                                    long long &, long long &);
-template void calculateARI2D<double>(const double *, const double *, double *,
-                                     double *, double, double, double, double,
-                                     int, double, long long &, long long &,
-                                     long long &, long long &);
-
-template void calculateARI3D<float>(const float *, const float *, const float *,
-                                    float *, float *, float *, float, float,
-                                    float, float, float, float, int, float,
-                                    long long &, long long &, long long &,
-                                    long long &);
-template void calculateARI3D<double>(const double *, const double *,
-                                     const double *, double *, double *,
-                                     double *, double, double, double, double,
-                                     double, double, int, double, long long &,
-                                     long long &, long long &, long long &);
+template void computeFoFRoots3D<float>(const float *, const float *,
+                                       const float *, float, float, float,
+                                       float, float, float, int, float, int **);
+template void computeFoFRoots3D<double>(const double *, const double *,
+                                        const double *, double, double, double,
+                                        double, double, double, int, double,
+                                        int **);
 
 template __global__ void buildHalos2D_kernel<float>(const float *,
                                                     const float *, const int *,

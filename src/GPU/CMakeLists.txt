@@ -24,7 +24,6 @@ add_executable(fofpz
     fileIO.cpp
     particle_compression.cu
     HuffmanZSTDCoder.cu
-    statistics.cu
     FOFHaloFinder.cu
 )
 
@@ -85,7 +84,6 @@ if(MPI_FOUND)
         fileIO.cpp
         particle_compression.cu
         HuffmanZSTDCoder.cu
-        statistics.cu
         FOFHaloFinder.cu
     )
 
@@ -130,4 +128,51 @@ if(MPI_FOUND)
             $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -pedantic>
         )
     endif()
+endif()
+
+# Standalone FoF halo metric evaluator. Keep this separate from fofpz so
+# compression profiling does not include quality-evaluation kernels.
+add_executable(fofpz_metrics
+    metrics_main.cu
+    fileIO.cpp
+    FOFHaloFinder.cu
+    FOFHaloMetrics.cu
+)
+
+set_target_properties(fofpz_metrics PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_ARCHITECTURES "75;80;86;89;90"
+)
+
+target_link_libraries(fofpz_metrics PRIVATE
+    CUDA::cudart
+    CUDA::cuda_driver
+)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    if(MSVC)
+        target_compile_options(fofpz_metrics PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/O2>
+        )
+    else()
+        target_compile_options(fofpz_metrics PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native>
+            $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+        )
+    endif()
+    target_compile_options(fofpz_metrics PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:
+            --ptxas-options=-v
+        >
+    )
+endif()
+
+if(MSVC)
+    target_compile_options(fofpz_metrics PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/W4>
+    )
+else()
+    target_compile_options(fofpz_metrics PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -pedantic>
+    )
 endif()
