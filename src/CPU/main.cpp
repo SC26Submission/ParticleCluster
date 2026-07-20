@@ -9,18 +9,42 @@ std::vector<std::string> inputFiles;
 std::vector<std::string> baseDecompFiles;
 std::string compressedFile;
 std::string decompressedFile;
-size_t D;      // dimension
-size_t N;      // number of particles
-float xi;      // coordinate-wise absolute error bound
-float b;       // linking length
+size_t D = 0;  // dimension
+size_t N = 0;  // number of particles
+float xi = 0;  // coordinate-wise absolute error bound
+float b = 0;   // linking length
 float d = 0.2; // dimensionless linking length parameter
 bool isDouble;
 bool isABS;
 bool isEdit = true; // Compress and edit, or compress only
 bool isPGD = true;  // PGD for or losslessly store vulnerable pairs
 OrderMode mode = OrderMode::MORTON_CODE;
+FoFConstraintStrategy fof_constraint_strategy =
+    FoFConstraintStrategy::PAIRWISE_VULNERABILITY;
 size_t max_iter = 1000;
 double lr = 0.01;
+double target_cell_occupancy =
+    0; // 0 means finest dense grid up to SIZE_MAX cells
+
+void parseError(const char error[]);
+
+FoFConstraintStrategy parseFoFConstraintStrategy(const std::string &value) {
+  if (value == "1" || value == "pairwise" ||
+      value == "pairwise-vulnerability") {
+    return FoFConstraintStrategy::PAIRWISE_VULNERABILITY;
+  }
+  if (value == "2" || value == "safe-filter" ||
+      value == "safe-component-filtering") {
+    return FoFConstraintStrategy::SAFE_COMPONENT_FILTERING;
+  }
+  if (value == "3" || value == "contracted-forest" ||
+      value == "contracted-halo-forest") {
+    return FoFConstraintStrategy::CONTRACTED_HALO_FOREST;
+  }
+  parseError("FoF constraint strategy must be 1/pairwise-vulnerability, "
+             "2/safe-component-filtering, or 3/contracted-halo-forest");
+  return FoFConstraintStrategy::PAIRWISE_VULNERABILITY;
+}
 
 void parseError(const char error[]) {
   fprintf(stderr, "%s\n", error);
@@ -42,6 +66,11 @@ void parseError(const char error[]) {
   fprintf(stderr, "  -B <d>          : Specify the linking length parameter\n");
   fprintf(stderr, "  -KD             : Use k-d tree as reordering method\n");
   fprintf(stderr, "  -MC             : Use Morton code as reordering method\n");
+  fprintf(stderr, "  -CS <strategy>  : FoF constraint strategy: "
+                  "1/pairwise-vulnerability, 2/safe-component-filtering, "
+                  "3/contracted-halo-forest\n");
+  fprintf(stderr, "  -occ <n>        : Target particles per grid cell "
+                  "(default: finest dense grid)\n");
   fprintf(stderr, "  -lr             : Specify the learning rate in PGD\n");
   fprintf(stderr, "  -iter           : Specify the max iter count in PGD\n");
   fprintf(stderr, "  -c              : Compression only\n");
@@ -96,10 +125,20 @@ void Parsing(int argc, char *argv[]) {
       mode = OrderMode::KD_TREE;
     } else if (arg == "-MC") {
       mode = OrderMode::MORTON_CODE;
+    } else if (arg == "-CS" || arg == "-cs") {
+      if (i + 1 >= argc)
+        parseError("Missing FoF constraint strategy");
+      fof_constraint_strategy = parseFoFConstraintStrategy(argv[++i]);
     } else if (arg == "-lr") {
       lr = std::stof(argv[++i]);
     } else if (arg == "-iter") {
       max_iter = std::stoull(argv[++i]);
+    } else if (arg == "-occ") {
+      if (i + 1 >= argc)
+        parseError("Missing target cell occupancy");
+      target_cell_occupancy = std::stod(argv[++i]);
+      if (target_cell_occupancy <= 0)
+        parseError("Target cell occupancy must be positive");
     } else if (arg == "-c") {
       isEdit = false;
     } else if (arg == "-l") {
@@ -358,6 +397,23 @@ template <typename T, OrderMode Mode> void run3D() {
 int main(int argc, char *argv[]) {
   Parsing(argc, argv);
 
+#ifdef USE_LIKWID
+  // Initialize LIKWID markers and pre-register every region inside a parallel
+  // region so per-thread counters are ready before the first START.
+  LIKWID_MARKER_INIT;
+#pragma omp parallel
+  {
+    LIKWID_MARKER_REGISTER("spatial_partition");
+    LIKWID_MARKER_REGISTER("find_vulnerable_pairs");
+    LIKWID_MARKER_REGISTER("union_find_mode_filter");
+    LIKWID_MARKER_REGISTER("pgd_loss");
+    LIKWID_MARKER_REGISTER("pgd_gradient");
+    LIKWID_MARKER_REGISTER("pgd_update");
+    LIKWID_MARKER_REGISTER("edit_quantization");
+    LIKWID_MARKER_REGISTER("lossless_compression");
+  }
+#endif
+
   if (isDouble) {
     if (D == 2) {
       if (mode == OrderMode::KD_TREE) {
@@ -387,4 +443,8 @@ int main(int argc, char *argv[]) {
       }
     }
   }
+
+#ifdef USE_LIKWID
+  LIKWID_MARKER_CLOSE;
+#endif
 }

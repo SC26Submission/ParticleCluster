@@ -9,6 +9,19 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(ZSTD REQUIRED libzstd)
 find_package(OpenMP REQUIRED)
 
+# Optional LIKWID marker instrumentation for per-region CPU roofline profiling
+# (memory bandwidth + FLOP/s -> arithmetic intensity). Enable with:
+#   cmake -DUSE_LIKWID=ON ..   (requires liblikwid + likwid-marker.h; e.g. `module load likwid`)
+option(USE_LIKWID "Enable LIKWID marker instrumentation" OFF)
+if(USE_LIKWID)
+    find_library(LIKWID_LIB NAMES likwid)
+    find_path(LIKWID_INCLUDE_DIR NAMES likwid-marker.h)
+    if(NOT LIKWID_LIB OR NOT LIKWID_INCLUDE_DIR)
+        message(FATAL_ERROR "USE_LIKWID=ON but liblikwid/likwid-marker.h not found; `module load likwid` or set LIKWID_LIB and LIKWID_INCLUDE_DIR.")
+    endif()
+    message(STATUS "LIKWID enabled: ${LIKWID_LIB} (include: ${LIKWID_INCLUDE_DIR})")
+endif()
+
 # Add include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -21,6 +34,11 @@ add_executable(fofpz_cpu
 # Link Packages
 target_include_directories(fofpz_cpu PRIVATE ${ZSTD_INCLUDE_DIRS})
 target_link_libraries(fofpz_cpu PRIVATE ${ZSTD_LIBRARIES} OpenMP::OpenMP_CXX)
+if(USE_LIKWID)
+    target_compile_definitions(fofpz_cpu PRIVATE USE_LIKWID)
+    target_include_directories(fofpz_cpu PRIVATE ${LIKWID_INCLUDE_DIR})
+    target_link_libraries(fofpz_cpu PRIVATE ${LIKWID_LIB})
+endif()
 
 # Enable optimization
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
@@ -48,6 +66,11 @@ if(MPI_FOUND)
     target_include_directories(fofpz_cpu_mpi PRIVATE ${ZSTD_INCLUDE_DIRS})
     target_link_libraries(fofpz_cpu_mpi PRIVATE ${ZSTD_LIBRARIES} MPI::MPI_CXX OpenMP::OpenMP_CXX)
     target_compile_definitions(fofpz_cpu_mpi PRIVATE USE_MPI)
+    if(USE_LIKWID)
+        target_compile_definitions(fofpz_cpu_mpi PRIVATE USE_LIKWID)
+        target_include_directories(fofpz_cpu_mpi PRIVATE ${LIKWID_INCLUDE_DIR})
+        target_link_libraries(fofpz_cpu_mpi PRIVATE ${LIKWID_LIB})
+    endif()
 
     if(CMAKE_BUILD_TYPE STREQUAL "Release")
         if(MSVC)

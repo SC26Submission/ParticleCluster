@@ -2,13 +2,16 @@
 
 #include "HuffmanZSTDCoder.h"
 #include "config.h"
+#include "likwid_markers.h"
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <omp.h>
 #include <queue>
 #include <unordered_map>
@@ -23,8 +26,53 @@ static const MPI_Comm MPI_COMM_NULL = 0;
 
 extern size_t max_iter;
 extern double lr;
+extern double target_cell_occupancy;
+
+struct FoFEditTiming {
+  double fof_setup = 0.0;
+  double fof_spatial_partition = 0.0;
+  double fof_vulnerable_pairs = 0.0;
+  double fof_union_find = 0.0;
+  double fof_mode_filtering = 0.0;
+  double fof_editable_table = 0.0;
+  double fof_other = 0.0;
+  double pgd_total = 0.0;
+  double pgd_allreduce = 0.0;
+  size_t pgd_allreduce_calls = 0;
+  double edit_encoding = 0.0;
+  double total = 0.0;
+};
 
 enum class OrderMode { KD_TREE, MORTON_CODE };
+
+enum class FoFConstraintStrategy {
+  PAIRWISE_VULNERABILITY,
+  SAFE_COMPONENT_FILTERING,
+  CONTRACTED_HALO_FOREST
+};
+
+extern FoFConstraintStrategy fof_constraint_strategy;
+
+static inline const char *
+fofConstraintStrategyName(FoFConstraintStrategy strategy) {
+  switch (strategy) {
+  case FoFConstraintStrategy::PAIRWISE_VULNERABILITY:
+    return "1/pairwise-vulnerability";
+  case FoFConstraintStrategy::SAFE_COMPONENT_FILTERING:
+    return "2/safe-component-filtering";
+  case FoFConstraintStrategy::CONTRACTED_HALO_FOREST:
+    return "3/contracted-halo-forest";
+  }
+  return "unknown";
+}
+
+static inline bool needsSafeComponentRoots(FoFConstraintStrategy strategy) {
+  return strategy != FoFConstraintStrategy::PAIRWISE_VULNERABILITY;
+}
+
+static inline bool needsOriginalHaloRoots(FoFConstraintStrategy strategy) {
+  return strategy == FoFConstraintStrategy::CONTRACTED_HALO_FOREST;
+}
 
 // K-D Tree Implementation
 template <size_t D, typename T> struct KDNode {
@@ -263,6 +311,462 @@ inline std::vector<bool> unpackBits(const std::vector<uint8_t> packed,
   return unpacked;
 }
 
+
+static inline size_t maxCellsForTargetOccupancy(size_t N) {
+  if (target_cell_occupancy <= 0)
+    return SIZE_MAX;
+  double max_cells_f = std::ceil(static_cast<double>(N) / target_cell_occupancy);
+  if (max_cells_f >= static_cast<double>(SIZE_MAX))
+    return SIZE_MAX;
+  return std::max<size_t>(1, static_cast<size_t>(max_cells_f));
+}
+
+template <typename T> static inline size_t gridDimForRange(T range, T grid_len) {
+  if (range <= T(0))
+    return 1;
+  return std::max<size_t>(1, static_cast<size_t>(std::ceil(range / grid_len)));
+}
+
+template <typename T>
+static inline size_t cellCount2D(T range_x, T range_y, T grid_len,
+                                 size_t &dim_x, size_t &dim_y) {
+  dim_x = gridDimForRange(range_x, grid_len);
+  dim_y = gridDimForRange(range_y, grid_len);
+  if (dim_x != 0 && dim_y > SIZE_MAX / dim_x)
+    return SIZE_MAX;
+  return dim_x * dim_y;
+}
+
+template <typename T>
+static inline size_t cellCount3D(T range_x, T range_y, T range_z, T grid_len,
+                                 size_t &dim_x, size_t &dim_y,
+                                 size_t &dim_z) {
+  dim_x = gridDimForRange(range_x, grid_len);
+  dim_y = gridDimForRange(range_y, grid_len);
+  dim_z = gridDimForRange(range_z, grid_len);
+  if (dim_x != 0 && dim_y > SIZE_MAX / dim_x)
+    return SIZE_MAX;
+  size_t xy = dim_x * dim_y;
+  if (xy != 0 && dim_z > SIZE_MAX / xy)
+    return SIZE_MAX;
+  return xy * dim_z;
+}
+
+template <typename T>
+static void coarsenGrid2D(T &grid_len, size_t &grid_dim_x,
+                          size_t &grid_dim_y, T range_x, T range_y,
+                          size_t max_cells) {
+  size_t nc = grid_dim_x * grid_dim_y;
+  if (nc <= max_cells)
+    return;
+
+  T original_grid_len = grid_len;
+  T low = original_grid_len;
+  T high = original_grid_len *
+           std::sqrt(static_cast<T>(nc) / static_cast<T>(max_cells));
+  size_t dim_x = grid_dim_x;
+  size_t dim_y = grid_dim_y;
+  size_t nc_new = cellCount2D(range_x, range_y, high, dim_x, dim_y);
+
+  while (nc_new > max_cells) {
+    low = high;
+    high *= static_cast<T>(2);
+    nc_new = cellCount2D(range_x, range_y, high, dim_x, dim_y);
+  }
+
+  for (int iter = 0; iter < 32; ++iter) {
+    T mid = (low + high) * static_cast<T>(0.5);
+    size_t mid_x, mid_y;
+    size_t mid_cells = cellCount2D(range_x, range_y, mid, mid_x, mid_y);
+    if (mid_cells <= max_cells) {
+      high = mid;
+      dim_x = mid_x;
+      dim_y = mid_y;
+      nc_new = mid_cells;
+    } else {
+      low = mid;
+    }
+  }
+
+  grid_len = high;
+  grid_dim_x = dim_x;
+  grid_dim_y = dim_y;
+  printf("Grid coarsened: %zu -> %zu cells (grid_len %e, factor %.2fx)\n", nc,
+         nc_new, (double)grid_len, (double)(grid_len / original_grid_len));
+}
+
+template <typename T>
+static void coarsenGrid3D(T &grid_len, size_t &grid_dim_x,
+                          size_t &grid_dim_y, size_t &grid_dim_z, T range_x,
+                          T range_y, T range_z, size_t max_cells) {
+  size_t nc = grid_dim_x * grid_dim_y * grid_dim_z;
+  if (nc <= max_cells)
+    return;
+
+  T original_grid_len = grid_len;
+  T low = original_grid_len;
+  T high = original_grid_len *
+           std::cbrt(static_cast<T>(nc) / static_cast<T>(max_cells));
+  size_t dim_x = grid_dim_x;
+  size_t dim_y = grid_dim_y;
+  size_t dim_z = grid_dim_z;
+  size_t nc_new = cellCount3D(range_x, range_y, range_z, high, dim_x, dim_y,
+                              dim_z);
+
+  while (nc_new > max_cells) {
+    low = high;
+    high *= static_cast<T>(2);
+    nc_new = cellCount3D(range_x, range_y, range_z, high, dim_x, dim_y, dim_z);
+  }
+
+  for (int iter = 0; iter < 32; ++iter) {
+    T mid = (low + high) * static_cast<T>(0.5);
+    size_t mid_x, mid_y, mid_z;
+    size_t mid_cells = cellCount3D(range_x, range_y, range_z, mid, mid_x,
+                                   mid_y, mid_z);
+    if (mid_cells <= max_cells) {
+      high = mid;
+      dim_x = mid_x;
+      dim_y = mid_y;
+      dim_z = mid_z;
+      nc_new = mid_cells;
+    } else {
+      low = mid;
+    }
+  }
+
+  grid_len = high;
+  grid_dim_x = dim_x;
+  grid_dim_y = dim_y;
+  grid_dim_z = dim_z;
+  printf("Grid coarsened: %zu -> %zu cells (grid_len %e, factor %.2fx)\n", nc,
+         nc_new, (double)grid_len, (double)(grid_len / original_grid_len));
+}
+
+struct FoFConstraintUnionFind {
+  std::vector<size_t> parent;
+
+  explicit FoFConstraintUnionFind(size_t n = 0) : parent(n) {
+    std::iota(parent.begin(), parent.end(), size_t{0});
+  }
+
+  size_t find(size_t x) {
+    while (parent[x] != x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  }
+
+  bool unite(size_t a, size_t b) {
+    a = find(a);
+    b = find(b);
+    if (a == b)
+      return false;
+    if (a < b)
+      parent[b] = a;
+    else
+      parent[a] = b;
+    return true;
+  }
+};
+
+static inline void printFoFPairCountsOnce(size_t vulnerable_pairs,
+                                          size_t active_pairs) {
+  printf("Number of vulnerable pairs: %zu\n", vulnerable_pairs);
+  if (active_pairs != vulnerable_pairs)
+    printf("Number of active pairs: %zu\n", active_pairs);
+}
+
+static void rebuildEditablePointsFromPairs(
+    const std::vector<size_t> &pairs, size_t N, size_t N_local,
+    std::unordered_map<size_t, size_t> &editable_pts_map,
+    std::vector<size_t> &editable_pts) {
+  size_t eff_N_local = (N_local == 0 || N_local > N) ? N : N_local;
+  editable_pts_map.clear();
+  editable_pts.clear();
+  editable_pts.reserve(std::min(N, pairs.size()));
+  editable_pts_map.reserve(std::min(N, pairs.size()));
+  auto add = [&](size_t p) {
+    if (p >= eff_N_local)
+      return;
+    if (editable_pts_map.find(p) == editable_pts_map.end()) {
+      editable_pts_map[p] = editable_pts.size();
+      editable_pts.push_back(p);
+    }
+  };
+  for (size_t k = 0; k + 1 < pairs.size(); k += 2) {
+    add(pairs[k]);
+    add(pairs[k + 1]);
+  }
+}
+
+template <typename T>
+static void findVulnerablePairsCellPairs2D(
+    const T *org_xx, const T *org_yy, const std::vector<size_t> &indices_a,
+    const std::vector<size_t> &indices_b, bool same_cell, size_t N_local,
+    T lower_bound_sq, T upper_bound_sq, T sign_bound_sq,
+    std::vector<size_t> &pairs, std::vector<bool> &signs) {
+  auto visit = [&](size_t i, size_t j) {
+    if (i >= N_local && j >= N_local)
+      return;
+    T dx = org_xx[i] - org_xx[j];
+    T dy = org_yy[i] - org_yy[j];
+    T dist_sq = dx * dx + dy * dy;
+    if (dist_sq > lower_bound_sq && dist_sq <= upper_bound_sq) {
+      pairs.push_back(i);
+      pairs.push_back(j);
+      signs.push_back(dist_sq > sign_bound_sq);
+    }
+  };
+
+  if (same_cell) {
+    for (size_t a = 0; a < indices_a.size(); ++a)
+      for (size_t b = a + 1; b < indices_a.size(); ++b)
+        visit(indices_a[a], indices_a[b]);
+  } else {
+    for (size_t i : indices_a)
+      for (size_t j : indices_b)
+        visit(i, j);
+  }
+}
+
+template <typename T>
+static void findVulnerablePairsCellPairs3D(
+    const T *org_xx, const T *org_yy, const T *org_zz,
+    const std::vector<size_t> &indices_a,
+    const std::vector<size_t> &indices_b, bool same_cell, size_t N_local,
+    T lower_bound_sq, T upper_bound_sq, T sign_bound_sq,
+    std::vector<size_t> &pairs, std::vector<bool> &signs) {
+  auto visit = [&](size_t i, size_t j) {
+    if (i >= N_local && j >= N_local)
+      return;
+    T dx = org_xx[i] - org_xx[j];
+    T dy = org_yy[i] - org_yy[j];
+    T dz = org_zz[i] - org_zz[j];
+    T dist_sq = dx * dx + dy * dy + dz * dz;
+    if (dist_sq > lower_bound_sq && dist_sq <= upper_bound_sq) {
+      pairs.push_back(i);
+      pairs.push_back(j);
+      signs.push_back(dist_sq > sign_bound_sq);
+    }
+  };
+
+  if (same_cell) {
+    for (size_t a = 0; a < indices_a.size(); ++a)
+      for (size_t b = a + 1; b < indices_a.size(); ++b)
+        visit(indices_a[a], indices_a[b]);
+  } else {
+    for (size_t i : indices_a)
+      for (size_t j : indices_b)
+        visit(i, j);
+  }
+}
+
+template <typename T>
+static void applyFoFConstraintStrategy2D(
+    const T *org_xx, const T *org_yy,
+    const std::unordered_map<size_t, std::vector<size_t>> &cell_map,
+    size_t grid_dim_x, size_t grid_dim_y, size_t N, T lower_bound_sq,
+    T sign_bound_sq, std::vector<size_t> &pairs, std::vector<bool> &signs,
+    FoFEditTiming *timing = nullptr) {
+  FoFConstraintStrategy strategy = fof_constraint_strategy;
+  if (strategy == FoFConstraintStrategy::PAIRWISE_VULNERABILITY)
+    return;
+
+  auto union_start = std::chrono::high_resolution_clock::now();
+  FoFConstraintUnionFind safe_roots(N);
+  FoFConstraintUnionFind halo_roots(N);
+  bool need_safe = needsSafeComponentRoots(strategy) && lower_bound_sq > T(0);
+  bool need_halo = needsOriginalHaloRoots(strategy);
+  static constexpr int neighbor_offsets[4][2] = {
+      {1, 0}, {0, 1}, {1, 1}, {1, -1}};
+
+  auto distSq = [&](size_t i, size_t j) {
+    T dx = org_xx[i] - org_xx[j];
+    T dy = org_yy[i] - org_yy[j];
+    return dx * dx + dy * dy;
+  };
+  auto visit = [&](size_t i, size_t j) {
+    T d2 = distSq(i, j);
+    if (need_safe && d2 <= lower_bound_sq)
+      safe_roots.unite(i, j);
+    if (need_halo && d2 <= sign_bound_sq)
+      halo_roots.unite(i, j);
+  };
+
+  for (const auto &kv : cell_map) {
+    size_t id = kv.first;
+    const auto &indices = kv.second;
+    size_t id_x = id % grid_dim_x;
+    size_t id_y = id / grid_dim_x;
+    for (size_t a = 0; a < indices.size(); ++a)
+      for (size_t b = a + 1; b < indices.size(); ++b)
+        visit(indices[a], indices[b]);
+    for (const auto &off : neighbor_offsets) {
+      int nx = static_cast<int>(id_x) + off[0];
+      int ny = static_cast<int>(id_y) + off[1];
+      if (nx < 0 || nx >= static_cast<int>(grid_dim_x) || ny < 0 ||
+          ny >= static_cast<int>(grid_dim_y))
+        continue;
+      size_t neighbor_id = static_cast<size_t>(ny) * grid_dim_x + nx;
+      auto nit = cell_map.find(neighbor_id);
+      if (nit == cell_map.end())
+        continue;
+      for (size_t i : indices)
+        for (size_t j : nit->second)
+          visit(i, j);
+    }
+  }
+
+  if (timing) {
+    auto union_end = std::chrono::high_resolution_clock::now();
+    timing->fof_union_find +=
+        std::chrono::duration<double>(union_end - union_start).count();
+  }
+  auto filter_start = std::chrono::high_resolution_clock::now();
+
+  std::vector<size_t> filtered_pairs;
+  std::vector<bool> filtered_signs;
+  filtered_pairs.reserve(pairs.size());
+  filtered_signs.reserve(signs.size());
+  FoFConstraintUnionFind supernode_parent(N);
+  for (size_t k = 0; k < signs.size(); ++k) {
+    size_t p = pairs[2 * k];
+    size_t q = pairs[2 * k + 1];
+    bool keep = false;
+    if (strategy == FoFConstraintStrategy::SAFE_COMPONENT_FILTERING) {
+      keep = safe_roots.find(p) != safe_roots.find(q);
+    } else {
+      size_t safe_p = safe_roots.find(p);
+      size_t safe_q = safe_roots.find(q);
+      if (signs[k]) {
+        keep = halo_roots.find(p) != halo_roots.find(q);
+      } else if (safe_p != safe_q) {
+        keep = supernode_parent.unite(safe_p, safe_q);
+      }
+    }
+    if (keep) {
+      filtered_pairs.push_back(p);
+      filtered_pairs.push_back(q);
+      filtered_signs.push_back(signs[k]);
+    }
+  }
+  pairs.swap(filtered_pairs);
+  signs.swap(filtered_signs);
+  if (timing) {
+    auto filter_end = std::chrono::high_resolution_clock::now();
+    timing->fof_mode_filtering +=
+        std::chrono::duration<double>(filter_end - filter_start).count();
+  }
+}
+
+template <typename T>
+static void applyFoFConstraintStrategy3D(
+    const T *org_xx, const T *org_yy, const T *org_zz,
+    const std::unordered_map<size_t, std::vector<size_t>> &cell_map,
+    size_t grid_dim_x, size_t grid_dim_y, size_t grid_dim_z, size_t N,
+    T lower_bound_sq, T sign_bound_sq, std::vector<size_t> &pairs,
+    std::vector<bool> &signs, FoFEditTiming *timing = nullptr) {
+  FoFConstraintStrategy strategy = fof_constraint_strategy;
+  if (strategy == FoFConstraintStrategy::PAIRWISE_VULNERABILITY)
+    return;
+
+  auto union_start = std::chrono::high_resolution_clock::now();
+  FoFConstraintUnionFind safe_roots(N);
+  FoFConstraintUnionFind halo_roots(N);
+  bool need_safe = needsSafeComponentRoots(strategy) && lower_bound_sq > T(0);
+  bool need_halo = needsOriginalHaloRoots(strategy);
+  static constexpr int neighbor_offsets[13][3] = {
+      {1, 0, 0},  {0, 1, 0},  {0, 0, 1},  {1, 1, 0},  {1, -1, 0},
+      {1, 0, 1},  {1, 0, -1}, {0, 1, 1},  {0, 1, -1}, {1, 1, 1},
+      {1, 1, -1}, {1, -1, 1}, {1, -1, -1}};
+  size_t dim_xy = grid_dim_x * grid_dim_y;
+
+  auto distSq = [&](size_t i, size_t j) {
+    T dx = org_xx[i] - org_xx[j];
+    T dy = org_yy[i] - org_yy[j];
+    T dz = org_zz[i] - org_zz[j];
+    return dx * dx + dy * dy + dz * dz;
+  };
+  auto visit = [&](size_t i, size_t j) {
+    T d2 = distSq(i, j);
+    if (need_safe && d2 <= lower_bound_sq)
+      safe_roots.unite(i, j);
+    if (need_halo && d2 <= sign_bound_sq)
+      halo_roots.unite(i, j);
+  };
+
+  for (const auto &kv : cell_map) {
+    size_t id = kv.first;
+    const auto &indices = kv.second;
+    size_t id_x = id % grid_dim_x;
+    size_t id_y = (id / grid_dim_x) % grid_dim_y;
+    size_t id_z = id / dim_xy;
+    for (size_t a = 0; a < indices.size(); ++a)
+      for (size_t b = a + 1; b < indices.size(); ++b)
+        visit(indices[a], indices[b]);
+    for (const auto &off : neighbor_offsets) {
+      int nx = static_cast<int>(id_x) + off[0];
+      int ny = static_cast<int>(id_y) + off[1];
+      int nz = static_cast<int>(id_z) + off[2];
+      if (nx < 0 || nx >= static_cast<int>(grid_dim_x) || ny < 0 ||
+          ny >= static_cast<int>(grid_dim_y) || nz < 0 ||
+          nz >= static_cast<int>(grid_dim_z))
+        continue;
+      size_t neighbor_id = static_cast<size_t>(nz) * dim_xy +
+                           static_cast<size_t>(ny) * grid_dim_x + nx;
+      auto nit = cell_map.find(neighbor_id);
+      if (nit == cell_map.end())
+        continue;
+      for (size_t i : indices)
+        for (size_t j : nit->second)
+          visit(i, j);
+    }
+  }
+
+  if (timing) {
+    auto union_end = std::chrono::high_resolution_clock::now();
+    timing->fof_union_find +=
+        std::chrono::duration<double>(union_end - union_start).count();
+  }
+  auto filter_start = std::chrono::high_resolution_clock::now();
+
+  std::vector<size_t> filtered_pairs;
+  std::vector<bool> filtered_signs;
+  filtered_pairs.reserve(pairs.size());
+  filtered_signs.reserve(signs.size());
+  FoFConstraintUnionFind supernode_parent(N);
+  for (size_t k = 0; k < signs.size(); ++k) {
+    size_t p = pairs[2 * k];
+    size_t q = pairs[2 * k + 1];
+    bool keep = false;
+    if (strategy == FoFConstraintStrategy::SAFE_COMPONENT_FILTERING) {
+      keep = safe_roots.find(p) != safe_roots.find(q);
+    } else {
+      size_t safe_p = safe_roots.find(p);
+      size_t safe_q = safe_roots.find(q);
+      if (signs[k]) {
+        keep = halo_roots.find(p) != halo_roots.find(q);
+      } else if (safe_p != safe_q) {
+        keep = supernode_parent.unite(safe_p, safe_q);
+      }
+    }
+    if (keep) {
+      filtered_pairs.push_back(p);
+      filtered_pairs.push_back(q);
+      filtered_signs.push_back(signs[k]);
+    }
+  }
+  pairs.swap(filtered_pairs);
+  signs.swap(filtered_signs);
+  if (timing) {
+    auto filter_end = std::chrono::high_resolution_clock::now();
+    timing->fof_mode_filtering +=
+        std::chrono::duration<double>(filter_end - filter_start).count();
+  }
+}
+
 // Compression functions for one cell
 template <typename T>
 void compressParticles2D_KDTree(const T *org_xx, const T *org_yy,
@@ -443,7 +947,10 @@ void projectedGradientDescent2D(
     const std::unordered_map<size_t, size_t> &editable_pts_map,
     const std::vector<size_t> &editable_pts, T *decomp_xx, T *decomp_yy,
     std::vector<T> &edit_x, std::vector<T> &edit_y, T b, T xi,
-    size_t &iter_used, T &final_loss, MPI_Comm comm = MPI_COMM_NULL) {
+    size_t &iter_used, T &final_loss, MPI_Comm comm = MPI_COMM_NULL,
+    double *pgd_total_seconds = nullptr,
+    double *pgd_allreduce_seconds = nullptr,
+    size_t *pgd_allreduce_calls = nullptr) {
 
   if (editable_pts_map.empty())
     return;
@@ -452,7 +959,8 @@ void projectedGradientDescent2D(
   T max_quant_dist_err = 2 * xi / ((1 << m) - 1) * 2 * sqrt(2);
   T upper_bound_dist = b + max_quant_dist_err;
   T lower_bound_dist = b - max_quant_dist_err;
-  T convergence_tol = max_quant_dist_err * max_quant_dist_err;
+  T convergence_tol = static_cast<T>(1e-10);
+  T decomp_tol = convergence_tol * convergence_tol;
   size_t n = editable_pts.size();
   std::vector<T> grad_x(n, T(0));
   std::vector<T> grad_y(n, T(0));
@@ -482,21 +990,27 @@ void projectedGradientDescent2D(
       std::chrono::high_resolution_clock::now().time_since_epoch()).count();
 #endif
   double t_allreduce_total_2d = 0.0;
+  size_t allreduce_calls_2d = 0;
   for (iter_used = 0; iter_used < max_iter; ++iter_used) {
     // #9: OpenMP parallel loss computation (reduction)
     final_loss = 0;
-    #pragma omp parallel for reduction(+:final_loss) schedule(static)
-    for (size_t p = 0; p < num_pairs; ++p) {
-      size_t i = vulnerable_pairs[2 * p];
-      size_t j = vulnerable_pairs[2 * p + 1];
-      T d_decomp = distance_decomp(i, j);
-      if (signs[p] && d_decomp <= upper_bound_dist) {
-        T violation = d_decomp - upper_bound_dist;
-        final_loss += violation * violation;
-      } else if (!signs[p] && d_decomp > lower_bound_dist) {
-        T violation = d_decomp - lower_bound_dist;
-        final_loss += violation * violation;
+    #pragma omp parallel
+    {
+      LIKWID_MARKER_START("pgd_loss");
+      #pragma omp for reduction(+:final_loss) schedule(static)
+      for (size_t p = 0; p < num_pairs; ++p) {
+        size_t i = vulnerable_pairs[2 * p];
+        size_t j = vulnerable_pairs[2 * p + 1];
+        T d_decomp = distance_decomp(i, j);
+        if (signs[p] && d_decomp <= upper_bound_dist) {
+          T violation = d_decomp - upper_bound_dist;
+          final_loss += violation * violation;
+        } else if (!signs[p] && d_decomp > lower_bound_dist) {
+          T violation = d_decomp - lower_bound_dist;
+          final_loss += violation * violation;
+        }
       }
+      LIKWID_MARKER_STOP("pgd_loss");
     }
 #ifdef USE_MPI
     if (comm != MPI_COMM_NULL) {
@@ -506,7 +1020,9 @@ void projectedGradientDescent2D(
                     std::is_same<T, float>::value ? MPI_FLOAT : MPI_DOUBLE,
                     MPI_SUM, comm);
       t_allreduce_total_2d += MPI_Wtime() - t_ar0;
-      if (global_loss < convergence_tol)
+      allreduce_calls_2d++;
+      final_loss = global_loss;
+      if (final_loss < convergence_tol)
         break;
     } else
 #endif
@@ -525,10 +1041,12 @@ void projectedGradientDescent2D(
       auto it_j = editable_pts_map.find(j);
 
       T d_decomp = distance_decomp(i, j);
-      if (d_decomp < max_quant_dist_err)
+      if (d_decomp < decomp_tol)
         continue;
-      if ((signs[p] && d_decomp <= b) || (!signs[p] && d_decomp > b)) {
-        T tmp = 2 * (d_decomp - b) / d_decomp;
+      if ((signs[p] && d_decomp <= upper_bound_dist) ||
+          (!signs[p] && d_decomp > lower_bound_dist)) {
+        T target = signs[p] ? upper_bound_dist : lower_bound_dist;
+        T tmp = 2 * (d_decomp - target) / d_decomp;
         T gc_x = tmp * (decomp_xx[i] - decomp_xx[j]);
         T gc_y = tmp * (decomp_yy[i] - decomp_yy[j]);
         if (it_i != editable_pts_map.end()) {
@@ -593,10 +1111,16 @@ void projectedGradientDescent2D(
       std::chrono::high_resolution_clock::now().time_since_epoch()).count()
       - t_pgd_start_2d;
 #endif
+  if (pgd_total_seconds)
+    *pgd_total_seconds = t_pgd_elapsed_2d;
+  if (pgd_allreduce_seconds)
+    *pgd_allreduce_seconds = t_allreduce_total_2d;
+  if (pgd_allreduce_calls)
+    *pgd_allreduce_calls = allreduce_calls_2d;
   printf("[Timer] PGD iterations (%zu iters): %f seconds\n", iter_used,
          t_pgd_elapsed_2d);
-  printf("[Timer] MPI_Allreduce (loss, %zu calls): %f seconds\n", iter_used,
-         t_allreduce_total_2d);
+  printf("[Timer] MPI_Allreduce (loss, %zu calls): %f seconds\n",
+         allreduce_calls_2d, t_allreduce_total_2d);
   fflush(stdout);
 }
 
@@ -608,7 +1132,9 @@ void projectedGradientDescent3D(
     const std::vector<size_t> &editable_pts, T *decomp_xx, T *decomp_yy,
     T *decomp_zz, std::vector<T> &edit_x, std::vector<T> &edit_y,
     std::vector<T> &edit_z, T b, T xi, size_t &iter_used, T &final_loss,
-    MPI_Comm comm = MPI_COMM_NULL) {
+    MPI_Comm comm = MPI_COMM_NULL, double *pgd_total_seconds = nullptr,
+    double *pgd_allreduce_seconds = nullptr,
+    size_t *pgd_allreduce_calls = nullptr) {
 
   if (editable_pts_map.empty())
     return;
@@ -617,7 +1143,8 @@ void projectedGradientDescent3D(
   T max_quant_dist_err = 2 * xi / ((1 << m) - 1) * 2 * sqrt(3);
   T upper_bound_dist = b + max_quant_dist_err;
   T lower_bound_dist = b - max_quant_dist_err;
-  T convergence_tol = max_quant_dist_err * max_quant_dist_err;
+  T convergence_tol = static_cast<T>(1e-10);
+  T decomp_tol = convergence_tol * convergence_tol;
   size_t n = editable_pts.size();
   std::vector<T> grad_x(n, T(0));
   std::vector<T> grad_y(n, T(0));
@@ -650,22 +1177,28 @@ void projectedGradientDescent3D(
       std::chrono::high_resolution_clock::now().time_since_epoch()).count();
 #endif
   double t_allreduce_total_3d = 0.0;
+  size_t allreduce_calls_3d = 0;
   for (iter_used = 0; iter_used < max_iter; ++iter_used) {
 
     // #9: OpenMP parallel loss computation 3D (reduction)
     final_loss = 0;
-    #pragma omp parallel for reduction(+:final_loss) schedule(static)
-    for (size_t p = 0; p < num_pairs; ++p) {
-      size_t i = vulnerable_pairs[2 * p];
-      size_t j = vulnerable_pairs[2 * p + 1];
-      T d_decomp = distance_decomp(i, j);
-      if (signs[p] && d_decomp <= upper_bound_dist) {
-        T violation = d_decomp - upper_bound_dist;
-        final_loss += violation * violation;
-      } else if (!signs[p] && d_decomp > lower_bound_dist) {
-        T violation = d_decomp - lower_bound_dist;
-        final_loss += violation * violation;
+    #pragma omp parallel
+    {
+      LIKWID_MARKER_START("pgd_loss");
+      #pragma omp for reduction(+:final_loss) schedule(static)
+      for (size_t p = 0; p < num_pairs; ++p) {
+        size_t i = vulnerable_pairs[2 * p];
+        size_t j = vulnerable_pairs[2 * p + 1];
+        T d_decomp = distance_decomp(i, j);
+        if (signs[p] && d_decomp <= upper_bound_dist) {
+          T violation = d_decomp - upper_bound_dist;
+          final_loss += violation * violation;
+        } else if (!signs[p] && d_decomp > lower_bound_dist) {
+          T violation = d_decomp - lower_bound_dist;
+          final_loss += violation * violation;
+        }
       }
+      LIKWID_MARKER_STOP("pgd_loss");
     }
 #ifdef USE_MPI
     if (comm != MPI_COMM_NULL) {
@@ -675,7 +1208,9 @@ void projectedGradientDescent3D(
                     std::is_same<T, float>::value ? MPI_FLOAT : MPI_DOUBLE,
                     MPI_SUM, comm);
       t_allreduce_total_3d += MPI_Wtime() - t_ar0;
-      if (global_loss < convergence_tol)
+      allreduce_calls_3d++;
+      final_loss = global_loss;
+      if (final_loss < convergence_tol)
         break;
     } else
 #endif
@@ -687,18 +1222,23 @@ void projectedGradientDescent3D(
     std::fill(grad_z.begin(), grad_z.end(), T(0));
 
     // #9: Gradient accumulation 3D (atomic updates)
-    #pragma omp parallel for schedule(static)
-    for (size_t p = 0; p < num_pairs; ++p) {
+    #pragma omp parallel
+    {
+      LIKWID_MARKER_START("pgd_gradient");
+      #pragma omp for schedule(static)
+      for (size_t p = 0; p < num_pairs; ++p) {
       size_t i = vulnerable_pairs[2 * p];
       size_t j = vulnerable_pairs[2 * p + 1];
       auto it_i = editable_pts_map.find(i);
       auto it_j = editable_pts_map.find(j);
 
       T d_decomp = distance_decomp(i, j);
-      if (d_decomp < max_quant_dist_err)
+      if (d_decomp < decomp_tol)
         continue;
-      if ((signs[p] && d_decomp <= b) || (!signs[p] && d_decomp > b)) {
-        T tmp = 2 * (d_decomp - b) / d_decomp;
+      if ((signs[p] && d_decomp <= upper_bound_dist) ||
+          (!signs[p] && d_decomp > lower_bound_dist)) {
+        T target = signs[p] ? upper_bound_dist : lower_bound_dist;
+        T tmp = 2 * (d_decomp - target) / d_decomp;
         T gc_x = tmp * (decomp_xx[i] - decomp_xx[j]);
         T gc_y = tmp * (decomp_yy[i] - decomp_yy[j]);
         T gc_z = tmp * (decomp_zz[i] - decomp_zz[j]);
@@ -719,6 +1259,8 @@ void projectedGradientDescent3D(
           grad_z[it_j->second] -= gc_z;
         }
       }
+      }
+      LIKWID_MARKER_STOP("pgd_gradient");
     }
 
     // Adam bias-corrected learning rate
@@ -727,8 +1269,11 @@ void projectedGradientDescent3D(
     T lr_t = adam_alpha * std::sqrt(1 - beta2_t) / (1 - beta1_t);
 
     // Adam update & project onto boxes
-    #pragma omp parallel for schedule(static)
-    for (size_t idx = 0; idx < n; ++idx) {
+    #pragma omp parallel
+    {
+      LIKWID_MARKER_START("pgd_update");
+      #pragma omp for schedule(static)
+      for (size_t idx = 0; idx < n; ++idx) {
       size_t i = editable_pts[idx];
       T prev_x = decomp_xx[i];
       T prev_y = decomp_yy[i];
@@ -772,6 +1317,8 @@ void projectedGradientDescent3D(
       edit_y[idx] += decomp_yy[i] - prev_y;
       edit_z[idx] += decomp_zz[i] - prev_z;
     }
+      LIKWID_MARKER_STOP("pgd_update");
+    }
   }
 #ifdef USE_MPI
   double t_pgd_elapsed_3d = MPI_Wtime() - t_pgd_start_3d;
@@ -780,10 +1327,16 @@ void projectedGradientDescent3D(
       std::chrono::high_resolution_clock::now().time_since_epoch()).count()
       - t_pgd_start_3d;
 #endif
+  if (pgd_total_seconds)
+    *pgd_total_seconds = t_pgd_elapsed_3d;
+  if (pgd_allreduce_seconds)
+    *pgd_allreduce_seconds = t_allreduce_total_3d;
+  if (pgd_allreduce_calls)
+    *pgd_allreduce_calls = allreduce_calls_3d;
   printf("[Timer] PGD iterations (%zu iters): %f seconds\n", iter_used,
          t_pgd_elapsed_3d);
-  printf("[Timer] MPI_Allreduce (loss, %zu calls): %f seconds\n", iter_used,
-         t_allreduce_total_3d);
+  printf("[Timer] MPI_Allreduce (loss, %zu calls): %f seconds\n",
+         allreduce_calls_3d, t_allreduce_total_3d);
   fflush(stdout);
 }
 
@@ -815,10 +1368,10 @@ void compressWithEditParticles2D(const T *org_xx, const T *org_yy, T min_x,
 
   // Compute grid dimensions
   T grid_len = b + 2 * std::sqrt(2) * xi;
-  compressed.grid_dim_x =
-      std::max(1, static_cast<int>(std::ceil(range_x / grid_len)));
-  compressed.grid_dim_y =
-      std::max(1, static_cast<int>(std::ceil(range_y / grid_len)));
+  compressed.grid_dim_x = gridDimForRange(range_x, grid_len);
+  compressed.grid_dim_y = gridDimForRange(range_y, grid_len);
+  coarsenGrid2D(grid_len, compressed.grid_dim_x, compressed.grid_dim_y,
+                range_x, range_y, maxCellsForTargetOccupancy(N));
 
   // Store grid min
   compressed.grid_min_x = min_x;
@@ -863,30 +1416,6 @@ void compressWithEditParticles2D(const T *org_xx, const T *org_yy, T min_x,
   static constexpr int neighbor_offsets[4][2] = {
       {1, 0}, {0, 1}, {1, 1}, {1, -1}};
 
-  auto distanceSquared = [&](size_t i, size_t j) {
-    T dx = org_xx[i] - org_xx[j];
-    T dy = org_yy[i] - org_yy[j];
-    return dx * dx + dy * dy;
-  };
-  auto addPt = [&](size_t i) {
-    if (i >= eff_N_local) return;
-    if (editable_pts_map.find(i) == editable_pts_map.end()) {
-      editable_pts_map[i] = editable_pts.size();
-      editable_pts.push_back(i);
-    }
-  };
-  auto checkAndAddPair = [&](size_t i, size_t j) {
-    if (i >= eff_N_local && j >= eff_N_local) return;
-    T dist_sq = distanceSquared(i, j);
-    if (dist_sq > lower_bound_sq && dist_sq <= upper_bound_sq) {
-      vulnerable_pairs.push_back(i);
-      vulnerable_pairs.push_back(j);
-      signs.push_back(dist_sq > sign_bound_sq);
-      addPt(i);
-      addPt(j);
-    }
-  };
-
   std::vector<bool> visited(N, false);
   size_t prev_cell = 0;
   size_t total_cells_2d = (size_t)compressed.grid_dim_x * compressed.grid_dim_y;
@@ -904,11 +1433,9 @@ void compressWithEditParticles2D(const T *org_xx, const T *org_yy, T min_x,
     auto &indices = cell_map[id];
 
     // Check pairs within the same cell
-    for (size_t i = 0; i < indices.size(); ++i) {
-      for (size_t j = i + 1; j < indices.size(); ++j) {
-        checkAndAddPair(indices[i], indices[j]);
-      }
-    }
+    findVulnerablePairsCellPairs2D(org_xx, org_yy, indices, indices, true,
+                                   eff_N_local, lower_bound_sq, upper_bound_sq,
+                                   sign_bound_sq, vulnerable_pairs, signs);
 
     // Check pairs with neighboring cells
     for (const auto &offset : neighbor_offsets) {
@@ -924,11 +1451,10 @@ void compressWithEditParticles2D(const T *org_xx, const T *org_yy, T min_x,
       if (nit == cell_map.end()) continue;
       const auto &n_indices = nit->second;
 
-      for (size_t i : indices) {
-        for (size_t j : n_indices) {
-          checkAndAddPair(i, j);
-        }
-      }
+      findVulnerablePairsCellPairs2D(org_xx, org_yy, indices, n_indices,
+                                     false, eff_N_local, lower_bound_sq,
+                                     upper_bound_sq, sign_bound_sq,
+                                     vulnerable_pairs, signs);
     }
 
     // Compress particles during reordering by k-d tree or Morton code
@@ -953,7 +1479,17 @@ void compressWithEditParticles2D(const T *org_xx, const T *org_yy, T min_x,
                                total_cells_2d - prev_cell,
                                static_cast<UInt>(0));
 
-  printf("Number of vulnerable pairs: %zu\n", vulnerable_pairs.size() / 2);
+  {
+    size_t candidate_vulnerable_pairs = vulnerable_pairs.size() / 2;
+    applyFoFConstraintStrategy2D(org_xx, org_yy, cell_map,
+                                 compressed.grid_dim_x, compressed.grid_dim_y,
+                                 N, lower_bound_sq, sign_bound_sq,
+                                 vulnerable_pairs, signs);
+    rebuildEditablePointsFromPairs(vulnerable_pairs, N, eff_N_local,
+                                   editable_pts_map, editable_pts);
+    printFoFPairCountsOnce(candidate_vulnerable_pairs,
+                           vulnerable_pairs.size() / 2);
+  }
   printf("Number of editable particles: %zu\n", editable_pts.size());
 
   // Count violated pairs before PGD
@@ -1120,10 +1656,10 @@ void compressParticles2D(const T *org_xx, const T *org_yy, T min_x, T range_x,
 
   // Compute grid dimensions
   T grid_len = b + 2 * std::sqrt(2) * xi;
-  compressed.grid_dim_x =
-      std::max(1, static_cast<int>(std::ceil(range_x / grid_len)));
-  compressed.grid_dim_y =
-      std::max(1, static_cast<int>(std::ceil(range_y / grid_len)));
+  compressed.grid_dim_x = gridDimForRange(range_x, grid_len);
+  compressed.grid_dim_y = gridDimForRange(range_y, grid_len);
+  coarsenGrid2D(grid_len, compressed.grid_dim_x, compressed.grid_dim_y,
+                range_x, range_y, maxCellsForTargetOccupancy(N));
 
   // Store grid min
   compressed.grid_min_x = min_x;
@@ -1268,9 +1804,14 @@ void editParticles2D(const T *org_xx, const T *org_yy, T min_x, T range_x,
                      T min_y, T range_y, size_t N, T xi, T b, bool isPGD,
                      CompressionResults2D<T> &result,
                      CompressedData<T> &compressed,
-                     size_t N_local = 0, MPI_Comm comm = MPI_COMM_NULL) {
+                     size_t N_local = 0, MPI_Comm comm = MPI_COMM_NULL,
+                     FoFEditTiming *timing = nullptr) {
 
   auto start = std::chrono::high_resolution_clock::now();
+  if (timing)
+    *timing = FoFEditTiming{};
+  auto phase_start = start;
+  auto phase_end = start;
 
   if (N == 0)
     return;
@@ -1282,10 +1823,10 @@ void editParticles2D(const T *org_xx, const T *org_yy, T min_x, T range_x,
 
   // Compute grid dimensions
   T grid_len = b + 2 * std::sqrt(2) * xi;
-  compressed.grid_dim_x =
-      std::max(1, static_cast<int>(std::ceil(range_x / grid_len)));
-  compressed.grid_dim_y =
-      std::max(1, static_cast<int>(std::ceil(range_y / grid_len)));
+  compressed.grid_dim_x = gridDimForRange(range_x, grid_len);
+  compressed.grid_dim_y = gridDimForRange(range_y, grid_len);
+  coarsenGrid2D(grid_len, compressed.grid_dim_x, compressed.grid_dim_y,
+                range_x, range_y, maxCellsForTargetOccupancy(N));
 
   // Store grid min
   compressed.grid_min_x = min_x;
@@ -1305,6 +1846,12 @@ void editParticles2D(const T *org_xx, const T *org_yy, T min_x, T range_x,
     size_t id = cid_y * compressed.grid_dim_x + cid_x;
     cell_map[id].push_back(i);
   }
+
+  phase_end = std::chrono::high_resolution_clock::now();
+  if (timing)
+    timing->fof_spatial_partition +=
+        std::chrono::duration<double>(phase_end - phase_start).count();
+  phase_start = phase_end;
 
   // Process each cell (Vulnerable pairs detection)
   std::vector<size_t> vulnerable_pairs;
@@ -1328,30 +1875,6 @@ void editParticles2D(const T *org_xx, const T *org_yy, T min_x, T range_x,
   static constexpr int neighbor_offsets[4][2] = {
       {0, 1}, {1, 0}, {1, 1}, {1, -1}};
 
-  auto distanceSquared = [&](size_t i, size_t j) {
-    T dx = org_xx[i] - org_xx[j];
-    T dy = org_yy[i] - org_yy[j];
-    return dx * dx + dy * dy;
-  };
-  auto addPt = [&](size_t i) {
-    if (i >= eff_N_local) return;
-    if (editable_pts_map.find(i) == editable_pts_map.end()) {
-      editable_pts_map[i] = editable_pts.size();
-      editable_pts.push_back(i);
-    }
-  };
-  auto checkAndAddPair = [&](size_t i, size_t j) {
-    if (i >= eff_N_local && j >= eff_N_local) return;
-    T dist_sq = distanceSquared(i, j);
-    if (dist_sq > lower_bound_sq && dist_sq <= upper_bound_sq) {
-      vulnerable_pairs.push_back(i);
-      vulnerable_pairs.push_back(j);
-      signs.push_back(dist_sq > sign_bound_sq);
-      addPt(i);
-      addPt(j);
-    }
-  };
-
   std::vector<bool> visited(N, false);
 
   for (auto &kv : cell_map) {
@@ -1362,11 +1885,9 @@ void editParticles2D(const T *org_xx, const T *org_yy, T min_x, T range_x,
     size_t id_y = id / compressed.grid_dim_x;
 
     // Check pairs within the same cell
-    for (size_t i = 0; i < indices.size(); ++i) {
-      for (size_t j = i + 1; j < indices.size(); ++j) {
-        checkAndAddPair(indices[i], indices[j]);
-      }
-    }
+    findVulnerablePairsCellPairs2D(org_xx, org_yy, indices, indices, true,
+                                   eff_N_local, lower_bound_sq, upper_bound_sq,
+                                   sign_bound_sq, vulnerable_pairs, signs);
 
     // Check pairs with neighboring cells
     for (const auto &offset : neighbor_offsets) {
@@ -1382,15 +1903,36 @@ void editParticles2D(const T *org_xx, const T *org_yy, T min_x, T range_x,
       if (nit == cell_map.end()) continue;
       const auto &n_indices = nit->second;
 
-      for (size_t i : indices) {
-        for (size_t j : n_indices) {
-          checkAndAddPair(i, j);
-        }
-      }
+      findVulnerablePairsCellPairs2D(org_xx, org_yy, indices, n_indices,
+                                     false, eff_N_local, lower_bound_sq,
+                                     upper_bound_sq, sign_bound_sq,
+                                     vulnerable_pairs, signs);
     }
   }
 
-  printf("Number of vulnerable pairs: %zu\n", vulnerable_pairs.size() / 2);
+  phase_end = std::chrono::high_resolution_clock::now();
+  if (timing)
+    timing->fof_vulnerable_pairs +=
+        std::chrono::duration<double>(phase_end - phase_start).count();
+  phase_start = phase_end;
+
+  {
+    size_t candidate_vulnerable_pairs = vulnerable_pairs.size() / 2;
+    applyFoFConstraintStrategy2D(org_xx, org_yy, cell_map,
+                                 compressed.grid_dim_x, compressed.grid_dim_y,
+                                 N, lower_bound_sq, sign_bound_sq,
+                                 vulnerable_pairs, signs, timing);
+    auto editable_start = std::chrono::high_resolution_clock::now();
+    rebuildEditablePointsFromPairs(vulnerable_pairs, N, eff_N_local,
+                                   editable_pts_map, editable_pts);
+    if (timing) {
+      auto editable_end = std::chrono::high_resolution_clock::now();
+      timing->fof_editable_table +=
+          std::chrono::duration<double>(editable_end - editable_start).count();
+    }
+    printFoFPairCountsOnce(candidate_vulnerable_pairs,
+                           vulnerable_pairs.size() / 2);
+  }
   printf("Number of editable particles: %zu\n", editable_pts.size());
 
   // Count violated pairs before PGD
@@ -1409,6 +1951,18 @@ void editParticles2D(const T *org_xx, const T *org_yy, T min_x, T range_x,
     return violations;
   };
   printf("Violated pairs before editing: %zu\n", countViolations2D());
+  auto fof_setup_end = std::chrono::high_resolution_clock::now();
+  if (timing) {
+    timing->fof_setup =
+        std::chrono::duration<double>(fof_setup_end - start).count();
+    double detailed_fof = timing->fof_spatial_partition +
+                          timing->fof_vulnerable_pairs +
+                          timing->fof_union_find +
+                          timing->fof_mode_filtering +
+                          timing->fof_editable_table;
+    timing->fof_other +=
+        std::max(0.0, timing->fof_setup - detailed_fof);
+  }
 
   if (isPGD) {
     // Projected gradient descent
@@ -1416,10 +1970,20 @@ void editParticles2D(const T *org_xx, const T *org_yy, T min_x, T range_x,
     std::vector<T> edit_y;
     size_t iter_used = 0;
     T final_loss = 0;
+    double pgd_total_seconds = 0.0;
+    double pgd_allreduce_seconds = 0.0;
+    size_t pgd_allreduce_calls = 0;
     projectedGradientDescent2D(org_xx, org_yy, vulnerable_pairs, signs,
                                editable_pts_map, editable_pts, result.decomp_xx,
                                result.decomp_yy, edit_x, edit_y, b, xi,
-                               iter_used, final_loss, comm);
+                               iter_used, final_loss, comm, &pgd_total_seconds,
+                               &pgd_allreduce_seconds, &pgd_allreduce_calls);
+    if (timing) {
+      timing->pgd_total = pgd_total_seconds;
+      timing->pgd_allreduce = pgd_allreduce_seconds;
+      timing->pgd_allreduce_calls = pgd_allreduce_calls;
+    }
+    auto encode_start = std::chrono::high_resolution_clock::now();
 
     // Quantize edits (min: -2 * xi, max 2 * xi)
     std::vector<UInt2> quant_edits(2 * N,
@@ -1446,6 +2010,11 @@ void editParticles2D(const T *org_xx, const T *org_yy, T min_x, T range_x,
         huffmanZstdCompress(quant_edits, compressed.code_table_edit,
                             compressed.bit_stream_size_edit);
     compressed.size_edit = 2 * N;
+    if (timing)
+      timing->edit_encoding = std::chrono::duration<double>(
+                                std::chrono::high_resolution_clock::now() -
+                                encode_start)
+                                .count();
 
   } else {
     // Lossless edit mode: store original values in original particle order
@@ -1465,9 +2034,16 @@ void editParticles2D(const T *org_xx, const T *org_yy, T min_x, T range_x,
         huffmanZstdCompress(packed_flag, compressed.code_table_edit_flag,
                             compressed.bit_stream_size_edit_flag);
     compressed.size_edit = 0;
+    if (timing)
+      timing->edit_encoding = std::chrono::duration<double>(
+                                std::chrono::high_resolution_clock::now() -
+                                fof_setup_end)
+                                .count();
   }
 
   auto end = std::chrono::high_resolution_clock::now();
+  if (timing)
+    timing->total = std::chrono::duration<double>(end - start).count();
   std::chrono::duration<double> comp_time = end - start;
 
   size_t additional_size =
@@ -1537,12 +2113,12 @@ void compressWithEditParticles3D(const T *org_xx, const T *org_yy,
 
   // Compute grid dimensions
   T grid_len = b + 2 * std::sqrt(3) * xi;
-  compressed.grid_dim_x =
-      std::max(1, static_cast<int>(std::ceil(range_x / grid_len)));
-  compressed.grid_dim_y =
-      std::max(1, static_cast<int>(std::ceil(range_y / grid_len)));
-  compressed.grid_dim_z =
-      std::max(1, static_cast<int>(std::ceil(range_z / grid_len)));
+  compressed.grid_dim_x = gridDimForRange(range_x, grid_len);
+  compressed.grid_dim_y = gridDimForRange(range_y, grid_len);
+  compressed.grid_dim_z = gridDimForRange(range_z, grid_len);
+  coarsenGrid3D(grid_len, compressed.grid_dim_x, compressed.grid_dim_y,
+                compressed.grid_dim_z, range_x, range_y, range_z,
+                maxCellsForTargetOccupancy(N));
 
   // Store grid min
   compressed.grid_min_x = min_x;
@@ -1599,31 +2175,6 @@ void compressWithEditParticles3D(const T *org_xx, const T *org_yy,
       {1, 0, 1},  {1, 0, -1}, {0, 1, 1},  {0, 1, -1}, {1, 1, 1},
       {1, 1, -1}, {1, -1, 1}, {1, -1, -1}};
 
-  auto distanceSquared = [&](size_t i, size_t j) {
-    T dx = org_xx[i] - org_xx[j];
-    T dy = org_yy[i] - org_yy[j];
-    T dz = org_zz[i] - org_zz[j];
-    return dx * dx + dy * dy + dz * dz;
-  };
-  auto addPt = [&](size_t i) {
-    if (i >= eff_N_local) return;
-    if (editable_pts_map.find(i) == editable_pts_map.end()) {
-      editable_pts_map[i] = editable_pts.size();
-      editable_pts.push_back(i);
-    }
-  };
-  auto checkAndAddPair = [&](size_t i, size_t j) {
-    if (i >= eff_N_local && j >= eff_N_local) return;
-    T dist_sq = distanceSquared(i, j);
-    if (dist_sq > lower_bound_sq && dist_sq <= upper_bound_sq) {
-      vulnerable_pairs.push_back(i);
-      vulnerable_pairs.push_back(j);
-      signs.push_back(dist_sq > sign_bound_sq);
-      addPt(i);
-      addPt(j);
-    }
-  };
-
   // --- Pass 1: VP detection ---
   for (size_t ci = 0; ci < non_empty_ids.size(); ++ci) {
     size_t id = non_empty_ids[ci];
@@ -1637,11 +2188,10 @@ void compressWithEditParticles3D(const T *org_xx, const T *org_yy,
 
     // Find vulnerable pairs with distances in (b - 2 * xi, b + 2 * xi]
     // Check pairs within the same cell
-    for (size_t i = 0; i < indices.size(); ++i) {
-      for (size_t j = i + 1; j < indices.size(); ++j) {
-        checkAndAddPair(indices[i], indices[j]);
-      }
-    }
+    findVulnerablePairsCellPairs3D(org_xx, org_yy, org_zz, indices, indices,
+                                   true, eff_N_local, lower_bound_sq,
+                                   upper_bound_sq, sign_bound_sq,
+                                   vulnerable_pairs, signs);
 
     // Check pairs with neighboring cells
     for (const auto &offset : neighbor_offsets) {
@@ -1660,11 +2210,10 @@ void compressWithEditParticles3D(const T *org_xx, const T *org_yy,
       if (nit == cell_map.end()) continue;
       const auto &n_indices = nit->second;
 
-      for (size_t i : indices) {
-        for (size_t j : n_indices) {
-          checkAndAddPair(i, j);
-        }
-      }
+      findVulnerablePairsCellPairs3D(org_xx, org_yy, org_zz, indices,
+                                     n_indices, false, eff_N_local,
+                                     lower_bound_sq, upper_bound_sq,
+                                     sign_bound_sq, vulnerable_pairs, signs);
     }
   }
 
@@ -1726,7 +2275,17 @@ void compressWithEditParticles3D(const T *org_xx, const T *org_yy,
          std::chrono::duration<double>(phase_end - phase_start).count());
   phase_start = phase_end;
 
-  printf("Number of vulnerable pairs: %zu\n", vulnerable_pairs.size() / 2);
+  {
+    size_t candidate_vulnerable_pairs = vulnerable_pairs.size() / 2;
+    applyFoFConstraintStrategy3D(org_xx, org_yy, org_zz, cell_map,
+                                 compressed.grid_dim_x, compressed.grid_dim_y,
+                                 compressed.grid_dim_z, N, lower_bound_sq,
+                                 sign_bound_sq, vulnerable_pairs, signs);
+    rebuildEditablePointsFromPairs(vulnerable_pairs, N, eff_N_local,
+                                   editable_pts_map, editable_pts);
+    printFoFPairCountsOnce(candidate_vulnerable_pairs,
+                           vulnerable_pairs.size() / 2);
+  }
   printf("Number of editable particles: %zu\n", editable_pts.size());
 
   // Count violated pairs before PGD
@@ -1916,12 +2475,12 @@ void compressParticles3D(const T *org_xx, const T *org_yy, const T *org_zz,
 
   // Compute grid dimensions
   T grid_len = b + 2 * std::sqrt(3) * xi;
-  compressed.grid_dim_x =
-      std::max(1, static_cast<int>(std::ceil(range_x / grid_len)));
-  compressed.grid_dim_y =
-      std::max(1, static_cast<int>(std::ceil(range_y / grid_len)));
-  compressed.grid_dim_z =
-      std::max(1, static_cast<int>(std::ceil(range_z / grid_len)));
+  compressed.grid_dim_x = gridDimForRange(range_x, grid_len);
+  compressed.grid_dim_y = gridDimForRange(range_y, grid_len);
+  compressed.grid_dim_z = gridDimForRange(range_z, grid_len);
+  coarsenGrid3D(grid_len, compressed.grid_dim_x, compressed.grid_dim_y,
+                compressed.grid_dim_z, range_x, range_y, range_z,
+                maxCellsForTargetOccupancy(N));
 
   // Store grid min
   compressed.grid_min_x = min_x;
@@ -2081,9 +2640,12 @@ void editParticles3D(const T *org_xx, const T *org_yy, const T *org_zz, T min_x,
                      size_t N, T xi, T b, bool isPGD,
                      CompressionResults3D<T> &result,
                      CompressedData<T> &compressed,
-                     size_t N_local = 0, MPI_Comm comm = MPI_COMM_NULL) {
+                     size_t N_local = 0, MPI_Comm comm = MPI_COMM_NULL,
+                     FoFEditTiming *timing = nullptr) {
 
   auto start = std::chrono::high_resolution_clock::now();
+  if (timing)
+    *timing = FoFEditTiming{};
   auto phase_start = start;
   auto phase_end = start;
 
@@ -2097,12 +2659,12 @@ void editParticles3D(const T *org_xx, const T *org_yy, const T *org_zz, T min_x,
 
   // Compute grid dimensions
   T grid_len = b + 2 * std::sqrt(3) * xi;
-  compressed.grid_dim_x =
-      std::max(1, static_cast<int>(std::ceil(range_x / grid_len)));
-  compressed.grid_dim_y =
-      std::max(1, static_cast<int>(std::ceil(range_y / grid_len)));
-  compressed.grid_dim_z =
-      std::max(1, static_cast<int>(std::ceil(range_z / grid_len)));
+  compressed.grid_dim_x = gridDimForRange(range_x, grid_len);
+  compressed.grid_dim_y = gridDimForRange(range_y, grid_len);
+  compressed.grid_dim_z = gridDimForRange(range_z, grid_len);
+  coarsenGrid3D(grid_len, compressed.grid_dim_x, compressed.grid_dim_y,
+                compressed.grid_dim_z, range_x, range_y, range_z,
+                maxCellsForTargetOccupancy(N));
 
   // Store grid min
   compressed.grid_min_x = min_x;
@@ -2116,6 +2678,7 @@ void editParticles3D(const T *org_xx, const T *org_yy, const T *org_zz, T min_x,
   std::unordered_map<size_t, std::vector<size_t>> cell_map;
   size_t dim_xy_e3 = (size_t)compressed.grid_dim_x * compressed.grid_dim_y;
 
+  LIKWID_MARKER_START("spatial_partition");
   for (size_t i = 0; i < N; ++i) {
     size_t cid_x =
         static_cast<size_t>(std::floor((org_xx[i] - min_x) / grid_len));
@@ -2126,8 +2689,12 @@ void editParticles3D(const T *org_xx, const T *org_yy, const T *org_zz, T min_x,
     size_t id = cid_z * dim_xy_e3 + cid_y * compressed.grid_dim_x + cid_x;
     cell_map[id].push_back(i);
   }
+  LIKWID_MARKER_STOP("spatial_partition");
 
   phase_end = std::chrono::high_resolution_clock::now();
+  if (timing)
+    timing->fof_spatial_partition +=
+        std::chrono::duration<double>(phase_end - phase_start).count();
   printf("[Timer] Grid partitioning (edit): %f seconds\n",
          std::chrono::duration<double>(phase_end - phase_start).count());
   phase_start = phase_end;
@@ -2156,33 +2723,9 @@ void editParticles3D(const T *org_xx, const T *org_yy, const T *org_zz, T min_x,
       {1, 0, 1},  {1, 0, -1}, {0, 1, 1},  {0, 1, -1}, {1, 1, 1},
       {1, 1, -1}, {1, -1, 1}, {1, -1, -1}};
 
-  auto distanceSquared = [&](size_t i, size_t j) {
-    T dx = org_xx[i] - org_xx[j];
-    T dy = org_yy[i] - org_yy[j];
-    T dz = org_zz[i] - org_zz[j];
-    return dx * dx + dy * dy + dz * dz;
-  };
-  auto addPt = [&](size_t i) {
-    if (i >= eff_N_local) return;
-    if (editable_pts_map.find(i) == editable_pts_map.end()) {
-      editable_pts_map[i] = editable_pts.size();
-      editable_pts.push_back(i);
-    }
-  };
-  auto checkAndAddPair = [&](size_t i, size_t j) {
-    if (i >= eff_N_local && j >= eff_N_local) return;
-    T dist_sq = distanceSquared(i, j);
-    if (dist_sq > lower_bound_sq && dist_sq <= upper_bound_sq) {
-      vulnerable_pairs.push_back(i);
-      vulnerable_pairs.push_back(j);
-      signs.push_back(dist_sq > sign_bound_sq);
-      addPt(i);
-      addPt(j);
-    }
-  };
-
   std::vector<bool> visited(N, false);
 
+  LIKWID_MARKER_START("find_vulnerable_pairs");
   for (auto &kv : cell_map) {
     size_t id = kv.first;
     auto &indices = kv.second;
@@ -2192,11 +2735,10 @@ void editParticles3D(const T *org_xx, const T *org_yy, const T *org_zz, T min_x,
     size_t id_z = id / dim_xy_e3;
 
     // Find vulnerable links with distances in (b - 2 * xi, b + 2 * xi]
-    for (size_t i = 0; i < indices.size(); ++i) {
-      for (size_t j = i + 1; j < indices.size(); ++j) {
-        checkAndAddPair(indices[i], indices[j]);
-      }
-    }
+    findVulnerablePairsCellPairs3D(org_xx, org_yy, org_zz, indices, indices,
+                                   true, eff_N_local, lower_bound_sq,
+                                   upper_bound_sq, sign_bound_sq,
+                                   vulnerable_pairs, signs);
 
     // Check pairs with neighboring cells
     for (const auto &offset : neighbor_offsets) {
@@ -2215,20 +2757,42 @@ void editParticles3D(const T *org_xx, const T *org_yy, const T *org_zz, T min_x,
       if (nit == cell_map.end()) continue;
       const auto &n_indices = nit->second;
 
-      for (size_t i : indices) {
-        for (size_t j : n_indices) {
-          checkAndAddPair(i, j);
-        }
-      }
+      findVulnerablePairsCellPairs3D(org_xx, org_yy, org_zz, indices,
+                                     n_indices, false, eff_N_local,
+                                     lower_bound_sq, upper_bound_sq,
+                                     sign_bound_sq, vulnerable_pairs, signs);
     }
   }
+  LIKWID_MARKER_STOP("find_vulnerable_pairs");
 
   phase_end = std::chrono::high_resolution_clock::now();
+  if (timing)
+    timing->fof_vulnerable_pairs +=
+        std::chrono::duration<double>(phase_end - phase_start).count();
   printf("[Timer] VP detection (edit): %f seconds\n",
          std::chrono::duration<double>(phase_end - phase_start).count());
   phase_start = phase_end;
 
-  printf("Number of vulnerable pairs: %zu\n", vulnerable_pairs.size() / 2);
+  {
+    size_t candidate_vulnerable_pairs = vulnerable_pairs.size() / 2;
+    LIKWID_MARKER_START("union_find_mode_filter");
+    applyFoFConstraintStrategy3D(org_xx, org_yy, org_zz, cell_map,
+                                 compressed.grid_dim_x, compressed.grid_dim_y,
+                                 compressed.grid_dim_z, N, lower_bound_sq,
+                                 sign_bound_sq, vulnerable_pairs, signs,
+                                 timing);
+    auto editable_start = std::chrono::high_resolution_clock::now();
+    rebuildEditablePointsFromPairs(vulnerable_pairs, N, eff_N_local,
+                                   editable_pts_map, editable_pts);
+    LIKWID_MARKER_STOP("union_find_mode_filter");
+    if (timing) {
+      auto editable_end = std::chrono::high_resolution_clock::now();
+      timing->fof_editable_table +=
+          std::chrono::duration<double>(editable_end - editable_start).count();
+    }
+    printFoFPairCountsOnce(candidate_vulnerable_pairs,
+                           vulnerable_pairs.size() / 2);
+  }
   printf("Number of editable particles: %zu\n", editable_pts.size());
 
   // Count violated pairs before PGD
@@ -2248,6 +2812,18 @@ void editParticles3D(const T *org_xx, const T *org_yy, const T *org_zz, T min_x,
     return violations;
   };
   printf("Violated pairs before editing: %zu\n", countViolations3D());
+  auto fof_setup_end = std::chrono::high_resolution_clock::now();
+  if (timing) {
+    timing->fof_setup =
+        std::chrono::duration<double>(fof_setup_end - start).count();
+    double detailed_fof = timing->fof_spatial_partition +
+                          timing->fof_vulnerable_pairs +
+                          timing->fof_union_find +
+                          timing->fof_mode_filtering +
+                          timing->fof_editable_table;
+    timing->fof_other +=
+        std::max(0.0, timing->fof_setup - detailed_fof);
+  }
 
   if (isPGD) {
     // Projected gradient descent
@@ -2256,11 +2832,21 @@ void editParticles3D(const T *org_xx, const T *org_yy, const T *org_zz, T min_x,
     std::vector<T> edit_z;
     size_t iter_used = 0;
     T final_loss = 0;
+    double pgd_total_seconds = 0.0;
+    double pgd_allreduce_seconds = 0.0;
+    size_t pgd_allreduce_calls = 0;
     projectedGradientDescent3D(org_xx, org_yy, org_zz, vulnerable_pairs, signs,
                                editable_pts_map, editable_pts, result.decomp_xx,
                                result.decomp_yy, result.decomp_zz, edit_x,
                                edit_y, edit_z, b, xi, iter_used, final_loss,
-                               comm);
+                               comm, &pgd_total_seconds,
+                               &pgd_allreduce_seconds, &pgd_allreduce_calls);
+    if (timing) {
+      timing->pgd_total = pgd_total_seconds;
+      timing->pgd_allreduce = pgd_allreduce_seconds;
+      timing->pgd_allreduce_calls = pgd_allreduce_calls;
+    }
+    auto encode_start = std::chrono::high_resolution_clock::now();
 
     // Quantize edits (min: -2 * xi, max 2 * xi)
     std::vector<UInt2> quant_edits(3 * N,
@@ -2268,6 +2854,7 @@ void editParticles3D(const T *org_xx, const T *org_yy, const T *org_zz, T min_x,
     T quant_norm = ((1 << m) - 1) / (4 * xi);
     T dequant_norm = (4 * xi) / ((1 << m) - 1);
 
+    LIKWID_MARKER_START("edit_quantization");
     for (const auto &[i, ii] : editable_pts_map) {
       UInt2 quant_edit_x = (edit_x[ii] + 2 * xi) * quant_norm;
       UInt2 quant_edit_y = (edit_y[ii] + 2 * xi) * quant_norm;
@@ -2284,6 +2871,7 @@ void editParticles3D(const T *org_xx, const T *org_yy, const T *org_zz, T min_x,
       result.decomp_yy[i] += dequant_edit_y - edit_y[ii];
       result.decomp_zz[i] += dequant_edit_z - edit_z[ii];
     }
+    LIKWID_MARKER_STOP("edit_quantization");
     phase_end = std::chrono::high_resolution_clock::now();
     printf("[Timer] PGD + edit quantization (edit): %f seconds\n",
            std::chrono::duration<double>(phase_end - phase_start).count());
@@ -2293,10 +2881,17 @@ void editParticles3D(const T *org_xx, const T *org_yy, const T *org_zz, T min_x,
     printf("Number of iterations: %zu\n", iter_used);
     printf("PGD final loss: %f\n", final_loss);
 
+    LIKWID_MARKER_START("lossless_compression");
     compressed.compressed_quant_edits =
         huffmanZstdCompress(quant_edits, compressed.code_table_edit,
                             compressed.bit_stream_size_edit);
+    LIKWID_MARKER_STOP("lossless_compression");
     compressed.size_edit = 3 * N;
+    if (timing)
+      timing->edit_encoding = std::chrono::duration<double>(
+                                std::chrono::high_resolution_clock::now() -
+                                encode_start)
+                                .count();
 
     phase_end = std::chrono::high_resolution_clock::now();
     printf("[Timer] Huffman + ZSTD encoding (edit): %f seconds\n",
@@ -2322,9 +2917,16 @@ void editParticles3D(const T *org_xx, const T *org_yy, const T *org_zz, T min_x,
         huffmanZstdCompress(packed_flag, compressed.code_table_edit_flag,
                             compressed.bit_stream_size_edit_flag);
     compressed.size_edit = 0;
+    if (timing)
+      timing->edit_encoding = std::chrono::duration<double>(
+                                std::chrono::high_resolution_clock::now() -
+                                fof_setup_end)
+                                .count();
   }
 
   auto end = std::chrono::high_resolution_clock::now();
+  if (timing)
+    timing->total = std::chrono::duration<double>(end - start).count();
   std::chrono::duration<double> comp_time = end - start;
 
   size_t additional_size =
