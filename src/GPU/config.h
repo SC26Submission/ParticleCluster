@@ -25,14 +25,6 @@ using UInt2ForSize = std::conditional_t<
 
 using UInt2 = UInt2ForSize<m>;
 
-enum class OrderMode { KD_TREE, MORTON_CODE };
-
-enum class FoFConstraintStrategy {
-  PAIRWISE_VULNERABILITY = 1,
-  SAFE_COMPONENT_FILTERING = 2,
-  CONTRACTED_HALO_FOREST = 3
-};
-
 template <typename T> struct CompressedData {
   size_t size_flag{0};
   size_t size_quant{0};
@@ -50,12 +42,11 @@ template <typename T> struct CompressedData {
   T grid_min_x{}, grid_min_y{}, grid_min_z{};
   size_t grid_dim_x{}, grid_dim_y{}, grid_dim_z{};
   T xi{}, b{};
-  // PGD edit support mask: N particle bits, packed then Huffman+ZSTD.
-  std::vector<uint8_t> compressed_lossless_edit_flag;
-  std::unordered_map<uint8_t, std::pair<uint32_t, int>> code_table_edit_flag;
+  // Lossless edit mode (isPGD=false): store editable pts' original values
   size_t size_edit_flag{0};
+  std::unordered_map<uint8_t, std::pair<uint32_t, int>> code_table_edit_flag;
   size_t bit_stream_size_edit_flag{0};
-  std::vector<T>
-      lossless_edit_values; // D interleaved values per marked position
+  std::vector<uint8_t> compressed_lossless_edit_flag;
+  std::vector<T> lossless_edit_values; // D interleaved values
   size_t N_local{0}; // number of local (non-ghost) particles; 0 = all local
 };

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "config.cuh"
+#include "config.h"
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -183,14 +183,6 @@ void writeCompressedFile(const std::string &filename,
   ofs.write(reinterpret_cast<const char *>(data.lossless_edit_values.data()),
             sizeof(T) * edit_val_count);
 
-  // Write sparse edit mapping
-  size_t evp_count = data.editable_visit_positions.size();
-  ofs.write(reinterpret_cast<const char *>(&evp_count), sizeof(evp_count));
-  if (evp_count > 0)
-    ofs.write(
-        reinterpret_cast<const char *>(data.editable_visit_positions.data()),
-        sizeof(int) * evp_count);
-
   // Write N_local for distributed mode (0 = all local)
   ofs.write(reinterpret_cast<const char *>(&data.N_local),
             sizeof(data.N_local));
@@ -307,15 +299,6 @@ CompressedData<T> readCompressedFile(const std::string &filename) {
   ifs.read(reinterpret_cast<char *>(data.lossless_edit_values.data()),
            sizeof(T) * edit_val_count);
 
-  // Read sparse edit mapping
-  size_t evp_count = 0;
-  if (ifs.read(reinterpret_cast<char *>(&evp_count), sizeof(evp_count))) {
-    data.editable_visit_positions.resize(evp_count);
-    if (evp_count > 0)
-      ifs.read(reinterpret_cast<char *>(data.editable_visit_positions.data()),
-               sizeof(int) * evp_count);
-  }
-
   // Read N_local for distributed mode (optional, default 0 = all local)
   ifs.read(reinterpret_cast<char *>(&data.N_local), sizeof(data.N_local));
   if (!ifs) data.N_local = 0;
@@ -333,6 +316,7 @@ template <typename T> constexpr DataType dtype() {
 }
 
 // #5: Streaming block-wise deinterleave — reads in L1-friendly blocks
+// instead of allocating a full N*dim buffer and scattering.
 template <typename T>
 void readInterleavedBinary(const std::string &filename, size_t N, size_t dim,
                            T **outs) {
@@ -340,6 +324,7 @@ void readInterleavedBinary(const std::string &filename, size_t N, size_t dim,
   if (!ifs)
     throw std::runtime_error("Could not open file: " + filename);
 
+  // Block size tuned for L1 cache (~32KB): 4096 particles × 3 floats = 48KB
   constexpr size_t BLOCK = 4096;
   std::vector<T> buf(BLOCK * dim);
 
@@ -351,33 +336,6 @@ void readInterleavedBinary(const std::string &filename, size_t N, size_t dim,
     for (size_t i = 0; i < chunk; ++i)
       for (size_t d = 0; d < dim; ++d)
         outs[d][off + i] = buf[i * dim + d];
-  }
-}
-
-// #5: Streaming block-wise deinterleave for vectors
-template <typename T>
-void readInterleavedBinaryVecs(const std::string &filename, size_t dim,
-                               std::vector<T> *vecs) {
-  std::ifstream ifs(filename, std::ios::binary | std::ios::ate);
-  if (!ifs)
-    throw std::runtime_error("Could not open file: " + filename);
-  size_t total = static_cast<size_t>(ifs.tellg()) / sizeof(T);
-  size_t N = total / dim;
-  for (size_t d = 0; d < dim; ++d)
-    vecs[d].resize(N);
-
-  ifs.seekg(0, std::ios::beg);
-  constexpr size_t BLOCK = 4096;
-  std::vector<T> buf(BLOCK * dim);
-
-  for (size_t off = 0; off < N; off += BLOCK) {
-    size_t chunk = std::min(BLOCK, N - off);
-    ifs.read(reinterpret_cast<char *>(buf.data()), chunk * dim * sizeof(T));
-    if (!ifs)
-      throw std::runtime_error("Error reading file: " + filename);
-    for (size_t i = 0; i < chunk; ++i)
-      for (size_t d = 0; d < dim; ++d)
-        vecs[d][off + i] = buf[i * dim + d];
   }
 }
 

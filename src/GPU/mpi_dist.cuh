@@ -44,7 +44,8 @@ template <typename T> struct GhostBuffer {
 // BoundingBox serialization helpers
 // =============================================================================
 
-inline std::vector<double> flattenBBoxes(const std::vector<BoundingBox> &boxes) {
+inline std::vector<double>
+flattenBBoxes(const std::vector<BoundingBox> &boxes) {
   std::vector<double> flat(boxes.size() * 6);
   for (size_t i = 0; i < boxes.size(); ++i) {
     for (int d = 0; d < 3; ++d) {
@@ -215,16 +216,22 @@ std::vector<BoundingBox> detectSpatialClusters_GPU(const T *d_xx, const T *d_yy,
 
   for (int i = 0; i < N && num_occupied < candidates.size(); ++i) {
     double pt[3] = {(double)h_xx[i], (double)h_yy[i],
-                     (D >= 3 && !h_zz.empty()) ? (double)h_zz[i] : 0.0};
+                    (D >= 3 && !h_zz.empty()) ? (double)h_zz[i] : 0.0};
     size_t cidx = 0;
     size_t stride = 1;
     bool found = true;
     for (int dim = D - 1; dim >= 0; --dim) {
       auto &lb = lo_bounds[dim];
       auto it = std::upper_bound(lb.begin(), lb.end(), pt[dim]);
-      if (it == lb.begin()) { found = false; break; }
+      if (it == lb.begin()) {
+        found = false;
+        break;
+      }
       size_t idx = static_cast<size_t>(std::distance(lb.begin(), it) - 1);
-      if (pt[dim] > intervals[dim][idx].second) { found = false; break; }
+      if (pt[dim] > intervals[dim][idx].second) {
+        found = false;
+        break;
+      }
       cidx += idx * stride;
       stride *= interval_dims[dim];
     }
@@ -262,8 +269,8 @@ void computeLocalBBox2D_GPU(const T *d_xx, const T *d_yy, int N,
 }
 
 template <typename T>
-void computeLocalBBox3D_GPU(const T *d_xx, const T *d_yy, const T *d_zz,
-                            int N, BoundingBox &bbox) {
+void computeLocalBBox3D_GPU(const T *d_xx, const T *d_yy, const T *d_zz, int N,
+                            BoundingBox &bbox) {
   T min_x, max_x, range_x, min_y, max_y, range_y, min_z, max_z, range_z;
   getRange(d_xx, N, min_x, max_x, range_x);
   getRange(d_yy, N, min_y, max_y, range_y);
@@ -313,19 +320,20 @@ inline void discoverNeighbors(DistributedContext &ctx, double ghost_width,
     ctx.padded_bboxes[0].hi[d] = 0.0;
   }
 
-  // One bbox per rank: use Allgather (12 doubles per rank: tight + padded fused)
+  // One bbox per rank: use Allgather (12 doubles per rank: tight + padded
+  // fused)
   std::vector<double> local_fused =
-      flattenBBoxesFused(ctx.local_bboxes, ctx.padded_bboxes);  // 12 doubles
+      flattenBBoxesFused(ctx.local_bboxes, ctx.padded_bboxes); // 12 doubles
   std::vector<double> all_fused_flat(ctx.size * 12);
-  MPI_Allgather(local_fused.data(), 12, MPI_DOUBLE,
-                all_fused_flat.data(), 12, MPI_DOUBLE, comm);
+  MPI_Allgather(local_fused.data(), 12, MPI_DOUBLE, all_fused_flat.data(), 12,
+                MPI_DOUBLE, comm);
 
   // Reconstruct per-rank tight and padded bboxes
   std::vector<std::vector<BoundingBox>> all_tight(ctx.size);
   ctx.all_padded_per_rank.resize(ctx.size);
   for (int r = 0; r < ctx.size; ++r)
-    unflattenBBoxesFused(all_fused_flat.data() + r * 12, 1,
-                         all_tight[r], ctx.all_padded_per_rank[r]);
+    unflattenBBoxesFused(all_fused_flat.data() + r * 12, 1, all_tight[r],
+                         ctx.all_padded_per_rank[r]);
 
   // O(ranks^2) neighbor check — fast for <= hundreds of ranks
   ctx.neighbors.clear();
@@ -387,7 +395,8 @@ __global__ void ghostIdentifyKernel(const T *xx, const T *yy, const T *zz,
   }
 }
 
-// A3: Gather selected particles into packed SoA buffer [xx_0..n | yy_0..n | zz_0..n]
+// A3: Gather selected particles into packed SoA buffer [xx_0..n | yy_0..n |
+// zz_0..n]
 template <typename T>
 __global__ void gatherPackedKernel(const T *xx, const T *yy, const T *zz,
                                    const int *indices, int count, int D,
@@ -445,8 +454,7 @@ beginGhostExchange3D(const T *d_xx, const T *d_yy, const T *d_zz,
   pending.send_packed.resize(num_neighbors);
   pending.send_indices.resize(num_neighbors);
 
-  MPI_Datatype mpi_T =
-      std::is_same<T, float>::value ? MPI_FLOAT : MPI_DOUBLE;
+  MPI_Datatype mpi_T = std::is_same<T, float>::value ? MPI_FLOAT : MPI_DOUBLE;
 
   // C2: Allocate reusable device buffers for GPU ghost identification
   int *d_indices = nullptr, *d_count = nullptr;
@@ -508,10 +516,9 @@ beginGhostExchange3D(const T *d_xx, const T *d_yy, const T *d_zz,
     // Launch ghost identification kernel
     int block = 256;
     int grid = (static_cast<int>(N_local) + block - 1) / block;
-    ghostIdentifyKernel<T><<<grid, block>>>(d_xx, d_yy, d_zz,
-                                            static_cast<int>(N_local), d_hull,
-                                            d_boxes, num_boxes, 3, d_indices,
-                                            d_count);
+    ghostIdentifyKernel<T>
+        <<<grid, block>>>(d_xx, d_yy, d_zz, static_cast<int>(N_local), d_hull,
+                          d_boxes, num_boxes, 3, d_indices, d_count);
 
     // Read back count
     int count = 0;
@@ -530,8 +537,8 @@ beginGhostExchange3D(const T *d_xx, const T *d_yy, const T *d_zz,
       CUDA_CHECK(cudaMalloc(&d_pack_buf, (size_t)count * 3 * sizeof(T)));
       int gblock = 256;
       int ggrid = (count + gblock - 1) / gblock;
-      gatherPackedKernel<T>
-          <<<ggrid, gblock>>>(d_xx, d_yy, d_zz, d_indices, count, 3, d_pack_buf);
+      gatherPackedKernel<T><<<ggrid, gblock>>>(d_xx, d_yy, d_zz, d_indices,
+                                               count, 3, d_pack_buf);
 
 #ifdef USE_CUDA_AWARE_MPI
       // C1: Send directly from device
@@ -626,8 +633,7 @@ beginGhostExchange2D(const T *d_xx, const T *d_yy, size_t N_local,
   pending.send_packed.resize(num_neighbors);
   pending.send_indices.resize(num_neighbors);
 
-  MPI_Datatype mpi_T =
-      std::is_same<T, float>::value ? MPI_FLOAT : MPI_DOUBLE;
+  MPI_Datatype mpi_T = std::is_same<T, float>::value ? MPI_FLOAT : MPI_DOUBLE;
 
   // C2: Allocate reusable device buffers
   int *d_indices = nullptr, *d_count = nullptr;
@@ -703,8 +709,8 @@ beginGhostExchange2D(const T *d_xx, const T *d_yy, size_t N_local,
       CUDA_CHECK(cudaMalloc(&d_pack_buf, (size_t)count * 2 * sizeof(T)));
       int gblock = 256;
       int ggrid = (count + gblock - 1) / gblock;
-      gatherPackedKernel<T><<<ggrid, gblock>>>(
-          d_xx, d_yy, (const T *)nullptr, d_indices, count, 2, d_pack_buf);
+      gatherPackedKernel<T><<<ggrid, gblock>>>(d_xx, d_yy, (const T *)nullptr,
+                                               d_indices, count, 2, d_pack_buf);
 
 #ifdef USE_CUDA_AWARE_MPI
       CUDA_CHECK(cudaDeviceSynchronize());
@@ -860,11 +866,11 @@ void completeGhostExchange(PendingGhostExchange<T> &pending,
 
 template <typename T>
 void reexchangeGhostData3D(const std::vector<std::vector<int>> &send_indices,
-                            const T *h_xx, const T *h_yy, const T *h_zz,
-                            const std::vector<GhostBuffer<T>> &orig_ghosts,
-                            const DistributedContext &ctx,
-                            std::vector<GhostBuffer<T>> &new_ghosts,
-                            MPI_Comm comm) {
+                           const T *h_xx, const T *h_yy, const T *h_zz,
+                           const std::vector<GhostBuffer<T>> &orig_ghosts,
+                           const DistributedContext &ctx,
+                           std::vector<GhostBuffer<T>> &new_ghosts,
+                           MPI_Comm comm) {
   int num_neighbors = static_cast<int>(ctx.neighbors.size());
   MPI_Datatype mpi_T = std::is_same<T, float>::value ? MPI_FLOAT : MPI_DOUBLE;
 
@@ -875,8 +881,8 @@ void reexchangeGhostData3D(const std::vector<std::vector<int>> &send_indices,
     send_bufs[n].resize(cnt * 3);
     for (size_t i = 0; i < cnt; ++i) {
       int idx = send_indices[n][i];
-      send_bufs[n][i]           = h_xx[idx];
-      send_bufs[n][cnt + i]     = h_yy[idx];
+      send_bufs[n][i] = h_xx[idx];
+      send_bufs[n][cnt + i] = h_yy[idx];
       send_bufs[n][2 * cnt + i] = h_zz[idx];
     }
   }
@@ -904,8 +910,7 @@ void reexchangeGhostData3D(const std::vector<std::vector<int>> &send_indices,
     }
     if (orig_ghosts[n].count > 0) {
       MPI_Request req;
-      MPI_Irecv(recv_bufs[n].data(),
-                static_cast<int>(orig_ghosts[n].count * 3),
+      MPI_Irecv(recv_bufs[n].data(), static_cast<int>(orig_ghosts[n].count * 3),
                 mpi_T, ctx.neighbors[n], 2, comm, &req);
       reqs.push_back(req);
     }
@@ -915,20 +920,23 @@ void reexchangeGhostData3D(const std::vector<std::vector<int>> &send_indices,
   for (int n = 0; n < num_neighbors; ++n) {
     size_t cnt = orig_ghosts[n].count;
     if (cnt > 0) {
-      std::memcpy(new_ghosts[n].xx.data(), recv_bufs[n].data(),           cnt * sizeof(T));
-      std::memcpy(new_ghosts[n].yy.data(), recv_bufs[n].data() + cnt,     cnt * sizeof(T));
-      std::memcpy(new_ghosts[n].zz.data(), recv_bufs[n].data() + 2 * cnt, cnt * sizeof(T));
+      std::memcpy(new_ghosts[n].xx.data(), recv_bufs[n].data(),
+                  cnt * sizeof(T));
+      std::memcpy(new_ghosts[n].yy.data(), recv_bufs[n].data() + cnt,
+                  cnt * sizeof(T));
+      std::memcpy(new_ghosts[n].zz.data(), recv_bufs[n].data() + 2 * cnt,
+                  cnt * sizeof(T));
     }
   }
 }
 
 template <typename T>
 void reexchangeGhostData2D(const std::vector<std::vector<int>> &send_indices,
-                            const T *h_xx, const T *h_yy,
-                            const std::vector<GhostBuffer<T>> &orig_ghosts,
-                            const DistributedContext &ctx,
-                            std::vector<GhostBuffer<T>> &new_ghosts,
-                            MPI_Comm comm) {
+                           const T *h_xx, const T *h_yy,
+                           const std::vector<GhostBuffer<T>> &orig_ghosts,
+                           const DistributedContext &ctx,
+                           std::vector<GhostBuffer<T>> &new_ghosts,
+                           MPI_Comm comm) {
   int num_neighbors = static_cast<int>(ctx.neighbors.size());
   MPI_Datatype mpi_T = std::is_same<T, float>::value ? MPI_FLOAT : MPI_DOUBLE;
 
@@ -938,7 +946,7 @@ void reexchangeGhostData2D(const std::vector<std::vector<int>> &send_indices,
     send_bufs[n].resize(cnt * 2);
     for (size_t i = 0; i < cnt; ++i) {
       int idx = send_indices[n][i];
-      send_bufs[n][i]       = h_xx[idx];
+      send_bufs[n][i] = h_xx[idx];
       send_bufs[n][cnt + i] = h_yy[idx];
     }
   }
@@ -964,8 +972,7 @@ void reexchangeGhostData2D(const std::vector<std::vector<int>> &send_indices,
     }
     if (orig_ghosts[n].count > 0) {
       MPI_Request req;
-      MPI_Irecv(recv_bufs[n].data(),
-                static_cast<int>(orig_ghosts[n].count * 2),
+      MPI_Irecv(recv_bufs[n].data(), static_cast<int>(orig_ghosts[n].count * 2),
                 mpi_T, ctx.neighbors[n], 2, comm, &req);
       reqs.push_back(req);
     }
@@ -975,8 +982,10 @@ void reexchangeGhostData2D(const std::vector<std::vector<int>> &send_indices,
   for (int n = 0; n < num_neighbors; ++n) {
     size_t cnt = orig_ghosts[n].count;
     if (cnt > 0) {
-      std::memcpy(new_ghosts[n].xx.data(), recv_bufs[n].data(),       cnt * sizeof(T));
-      std::memcpy(new_ghosts[n].yy.data(), recv_bufs[n].data() + cnt, cnt * sizeof(T));
+      std::memcpy(new_ghosts[n].xx.data(), recv_bufs[n].data(),
+                  cnt * sizeof(T));
+      std::memcpy(new_ghosts[n].yy.data(), recv_bufs[n].data() + cnt,
+                  cnt * sizeof(T));
     }
   }
 }
@@ -1003,16 +1012,17 @@ void buildExtendedDeviceArrays3D(const T *d_local_xx, const T *d_local_yy,
   for (int i = 0; i < 3; ++i)
     CUDA_CHECK(cudaStreamCreate(&s_local[i]));
   CUDA_CHECK(cudaMemcpyAsync(d_ext_xx, d_local_xx, (size_t)N_local * sizeof(T),
-                              cudaMemcpyDeviceToDevice, s_local[0]));
+                             cudaMemcpyDeviceToDevice, s_local[0]));
   CUDA_CHECK(cudaMemcpyAsync(d_ext_yy, d_local_yy, (size_t)N_local * sizeof(T),
-                              cudaMemcpyDeviceToDevice, s_local[1]));
+                             cudaMemcpyDeviceToDevice, s_local[1]));
   CUDA_CHECK(cudaMemcpyAsync(d_ext_zz, d_local_zz, (size_t)N_local * sizeof(T),
-                              cudaMemcpyDeviceToDevice, s_local[2]));
+                             cudaMemcpyDeviceToDevice, s_local[2]));
 
   // Async H2D copies for ghosts — one stream per nonempty ghost buffer
   int num_nonempty = 0;
   for (const auto &g : ghosts)
-    if (g.count > 0) num_nonempty++;
+    if (g.count > 0)
+      num_nonempty++;
 
   std::vector<cudaStream_t> g_streams(num_nonempty);
   for (int i = 0; i < num_nonempty; ++i)
@@ -1023,11 +1033,14 @@ void buildExtendedDeviceArrays3D(const T *d_local_xx, const T *d_local_yy,
   for (const auto &g : ghosts) {
     if (g.count > 0) {
       CUDA_CHECK(cudaMemcpyAsync(d_ext_xx + offset, g.xx.data(),
-                                  g.count * sizeof(T), cudaMemcpyHostToDevice, g_streams[si]));
+                                 g.count * sizeof(T), cudaMemcpyHostToDevice,
+                                 g_streams[si]));
       CUDA_CHECK(cudaMemcpyAsync(d_ext_yy + offset, g.yy.data(),
-                                  g.count * sizeof(T), cudaMemcpyHostToDevice, g_streams[si]));
+                                 g.count * sizeof(T), cudaMemcpyHostToDevice,
+                                 g_streams[si]));
       CUDA_CHECK(cudaMemcpyAsync(d_ext_zz + offset, g.zz.data(),
-                                  g.count * sizeof(T), cudaMemcpyHostToDevice, g_streams[si]));
+                                 g.count * sizeof(T), cudaMemcpyHostToDevice,
+                                 g_streams[si]));
       offset += g.count;
       si++;
     }
@@ -1059,13 +1072,14 @@ void buildExtendedDeviceArrays2D(const T *d_local_xx, const T *d_local_yy,
   for (int i = 0; i < 2; ++i)
     CUDA_CHECK(cudaStreamCreate(&s_local[i]));
   CUDA_CHECK(cudaMemcpyAsync(d_ext_xx, d_local_xx, (size_t)N_local * sizeof(T),
-                              cudaMemcpyDeviceToDevice, s_local[0]));
+                             cudaMemcpyDeviceToDevice, s_local[0]));
   CUDA_CHECK(cudaMemcpyAsync(d_ext_yy, d_local_yy, (size_t)N_local * sizeof(T),
-                              cudaMemcpyDeviceToDevice, s_local[1]));
+                             cudaMemcpyDeviceToDevice, s_local[1]));
 
   int num_nonempty = 0;
   for (const auto &g : ghosts)
-    if (g.count > 0) num_nonempty++;
+    if (g.count > 0)
+      num_nonempty++;
 
   std::vector<cudaStream_t> g_streams(num_nonempty);
   for (int i = 0; i < num_nonempty; ++i)
@@ -1076,9 +1090,11 @@ void buildExtendedDeviceArrays2D(const T *d_local_xx, const T *d_local_yy,
   for (const auto &g : ghosts) {
     if (g.count > 0) {
       CUDA_CHECK(cudaMemcpyAsync(d_ext_xx + offset, g.xx.data(),
-                                  g.count * sizeof(T), cudaMemcpyHostToDevice, g_streams[si]));
+                                 g.count * sizeof(T), cudaMemcpyHostToDevice,
+                                 g_streams[si]));
       CUDA_CHECK(cudaMemcpyAsync(d_ext_yy + offset, g.yy.data(),
-                                  g.count * sizeof(T), cudaMemcpyHostToDevice, g_streams[si]));
+                                 g.count * sizeof(T), cudaMemcpyHostToDevice,
+                                 g_streams[si]));
       offset += g.count;
       si++;
     }

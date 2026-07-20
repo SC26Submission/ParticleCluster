@@ -148,7 +148,6 @@ private:
       dim3 block(256);
       dim3 grid((N + block.x - 1) / block.x);
       histogramKernel<<<grid, block>>>(d_data, N, d_histogram);
-      CHECK_CUDA(cudaDeviceSynchronize());
 
       std::vector<uint32_t> h_histogram(num_bins);
       CHECK_CUDA(cudaMemcpy(h_histogram.data(), d_histogram,
@@ -281,7 +280,7 @@ private:
 
 public:
   CompressionResult compress(const T *d_data, size_t N, int zstd_level = 3,
-                             bool verbose = false) {
+                             bool verbose = false, bool use_zstd = true) {
     if (N == 0) {
       throw std::runtime_error("Empty input data");
     }
@@ -371,7 +370,6 @@ public:
                                        d_lengths_lut, num_unique, d_codes,
                                        d_lengths, N);
     CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
 
     if (verbose) {
       cudaEventRecord(stop);
@@ -423,7 +421,6 @@ public:
     packBytesAligned<<<grid, block>>>(d_codes, d_lengths, d_bit_positions,
                                       d_packed, N);
     CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
 
     if (verbose) {
       cudaEventRecord(stop);
@@ -446,33 +443,41 @@ public:
       cudaEventRecord(start);
     }
 
-    // ZSTD compression
-    size_t zstd_bound = ZSTD_compressBound(total_bytes);
-    uint8_t *h_compressed = new uint8_t[zstd_bound];
+    uint8_t *h_compressed_final = nullptr;
+    size_t compressed_size = 0;
+    if (use_zstd) {
+      // ZSTD compression
+      size_t zstd_bound = ZSTD_compressBound(total_bytes);
+      uint8_t *h_compressed = new uint8_t[zstd_bound];
 
-    size_t compressed_size = ZSTD_compress(
-        h_compressed, zstd_bound, h_bitstream, total_bytes, zstd_level);
+      compressed_size = ZSTD_compress(
+          h_compressed, zstd_bound, h_bitstream, total_bytes, zstd_level);
 
-    if (ZSTD_isError(compressed_size)) {
-      delete[] h_bitstream;
+      if (ZSTD_isError(compressed_size)) {
+        delete[] h_bitstream;
+        delete[] h_compressed;
+        delete[] h_symbols;
+        delete[] h_codes;
+        delete[] h_lengths;
+        throw std::runtime_error("ZSTD compression failed");
+      }
+
+      h_compressed_final = new uint8_t[compressed_size];
+      std::copy(h_compressed, h_compressed + compressed_size,
+                h_compressed_final);
       delete[] h_compressed;
-      delete[] h_symbols;
-      delete[] h_codes;
-      delete[] h_lengths;
-      throw std::runtime_error("ZSTD compression failed");
+      delete[] h_bitstream;
+    } else {
+      h_compressed_final = h_bitstream;
+      compressed_size = total_bytes;
     }
-
-    // Resize compressed data (allocate exact size)
-    uint8_t *h_compressed_final = new uint8_t[compressed_size];
-    std::copy(h_compressed, h_compressed + compressed_size, h_compressed_final);
-    delete[] h_compressed;
-    delete[] h_bitstream;
 
     if (verbose) {
       cudaEventRecord(stop);
       cudaEventSynchronize(stop);
       cudaEventElapsedTime(&ms, start, stop);
-      printf("  ZSTD compress: %.2f ms\n", ms);
+      printf("  %s: %.2f ms\n", use_zstd ? "ZSTD compress" : "Keep Huffman",
+             ms);
     }
 
     // Cleanup GPU memory
@@ -494,7 +499,7 @@ public:
   }
 
   void decompress(const CompressionResult &result, T *d_output,
-                  bool verbose = false) {
+                  bool verbose = false, bool use_zstd = true) {
     cudaEvent_t start, stop;
     float ms;
 
@@ -504,23 +509,32 @@ public:
       cudaEventRecord(start);
     }
 
-    // ZSTD decompression
     uint8_t *h_bitstream = new uint8_t[result.original_bitstream_size];
+    if (use_zstd) {
+      // ZSTD decompression
+      size_t decompressed_size =
+          ZSTD_decompress(h_bitstream, result.original_bitstream_size,
+                          result.compressed_data, result.compressed_size);
 
-    size_t decompressed_size =
-        ZSTD_decompress(h_bitstream, result.original_bitstream_size,
-                        result.compressed_data, result.compressed_size);
-
-    if (ZSTD_isError(decompressed_size)) {
-      delete[] h_bitstream;
-      throw std::runtime_error("ZSTD decompression failed");
+      if (ZSTD_isError(decompressed_size)) {
+        delete[] h_bitstream;
+        throw std::runtime_error("ZSTD decompression failed");
+      }
+    } else {
+      if (result.compressed_size != result.original_bitstream_size) {
+        delete[] h_bitstream;
+        throw std::runtime_error("Huffman-only bitstream size mismatch");
+      }
+      std::copy(result.compressed_data,
+                result.compressed_data + result.compressed_size, h_bitstream);
     }
 
     if (verbose) {
       cudaEventRecord(stop);
       cudaEventSynchronize(stop);
       cudaEventElapsedTime(&ms, start, stop);
-      printf("  ZSTD decompress: %.2f ms\n", ms);
+      printf("  %s: %.2f ms\n",
+             use_zstd ? "ZSTD decompress" : "Load Huffman bitstream", ms);
       cudaEventRecord(start);
     }
 
@@ -839,6 +853,32 @@ huffmanZstdCompressDevice(const T *d_data, size_t N,
   return compressed;
 }
 
+template <typename T>
+std::vector<uint8_t>
+huffmanCompressDevice(const T *d_data, size_t N,
+                      std::unordered_map<T, std::pair<uint32_t, int>> &codeTableOut,
+                      size_t &bitstreamSizeOut) {
+  if (N == 0)
+    return {};
+
+  HuffmanZstdCompressor<T> compressor;
+  auto result = compressor.compress(d_data, N, 3, false, false);
+
+  codeTableOut.clear();
+  codeTableOut.reserve(result.num_symbols);
+  for (int i = 0; i < result.num_symbols; ++i) {
+    codeTableOut[result.symbol_table[i]] = {result.code_table[i],
+                                            (int)result.length_table[i]};
+  }
+  bitstreamSizeOut = result.original_bitstream_size;
+
+  std::vector<uint8_t> compressed(
+      result.compressed_data, result.compressed_data + result.compressed_size);
+  result.freeSymbolTables();
+  result.freeCompressedData();
+  return compressed;
+}
+
 // Host-vector version: copies to device internally
 template <typename T>
 std::vector<uint8_t>
@@ -891,6 +931,49 @@ huffmanZstdDecompress(const std::vector<uint8_t> &compressed,
   CHECK_CUDA(cudaMalloc(&d_output, numElements * sizeof(T)));
   HuffmanZstdCompressor<T> compressor;
   compressor.decompress(result, d_output, false);
+
+  std::vector<T> output(numElements);
+  CHECK_CUDA(cudaMemcpy(output.data(), d_output, numElements * sizeof(T),
+                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaFree(d_output));
+
+  result.freeSymbolTables();
+  result.freeCompressedData();
+  return output;
+}
+
+template <typename T>
+std::vector<T>
+huffmanDecompress(const std::vector<uint8_t> &compressed,
+                  const std::unordered_map<T, std::pair<uint32_t, int>> &codeTable,
+                  size_t numElements, size_t originalBitstreamSize) {
+  if (compressed.empty() || numElements == 0)
+    return {};
+
+  int num_symbols = static_cast<int>(codeTable.size());
+  typename HuffmanZstdCompressor<T>::CompressionResult result;
+  result.compressed_data = new uint8_t[compressed.size()];
+  std::copy(compressed.begin(), compressed.end(), result.compressed_data);
+  result.compressed_size = compressed.size();
+  result.num_symbols = num_symbols;
+  result.original_bitstream_size = originalBitstreamSize;
+  result.num_elements = numElements;
+
+  result.symbol_table = new T[num_symbols];
+  result.code_table = new uint32_t[num_symbols];
+  result.length_table = new uint8_t[num_symbols];
+  int i = 0;
+  for (const auto &[sym, code_len] : codeTable) {
+    result.symbol_table[i] = sym;
+    result.code_table[i] = code_len.first;
+    result.length_table[i] = static_cast<uint8_t>(code_len.second);
+    ++i;
+  }
+
+  T *d_output;
+  CHECK_CUDA(cudaMalloc(&d_output, numElements * sizeof(T)));
+  HuffmanZstdCompressor<T> compressor;
+  compressor.decompress(result, d_output, false, false);
 
   std::vector<T> output(numElements);
   CHECK_CUDA(cudaMemcpy(output.data(), d_output, numElements * sizeof(T),

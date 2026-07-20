@@ -1,5 +1,5 @@
 #include "fileIO.h"
-#include "particle_compression.cuh"
+#include "particle_compression.h"
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
@@ -9,20 +9,22 @@ std::vector<std::string> inputFiles;
 std::vector<std::string> baseDecompFiles;
 std::string compressedFile;
 std::string decompressedFile;
-int D;         // dimension
-int N;         // number of particles
+size_t D = 0;  // dimension
+size_t N = 0;  // number of particles
 float xi = 0;  // coordinate-wise absolute error bound
-float b;       // linking length
+float b = 0;   // linking length
 float d = 0.2; // dimensionless linking length parameter
 bool isDouble;
 bool isABS;
 bool isEdit = true; // Compress and edit, or compress only
+bool isPGD = true;  // PGD for or losslessly store vulnerable pairs
 OrderMode mode = OrderMode::MORTON_CODE;
 FoFConstraintStrategy fof_constraint_strategy =
     FoFConstraintStrategy::PAIRWISE_VULNERABILITY;
-int max_iter = 1000;
-double lr = 0.001;
-double target_cell_occupancy = 0; // 0 means automatic grid budget
+size_t max_iter = 1000;
+double lr = 0.01;
+double target_cell_occupancy =
+    0; // 0 means finest dense grid up to SIZE_MAX cells
 
 void parseError(const char error[]);
 
@@ -68,7 +70,7 @@ void parseError(const char error[]) {
                   "1/pairwise-vulnerability, 2/safe-component-filtering, "
                   "3/contracted-halo-forest\n");
   fprintf(stderr, "  -occ <n>        : Target particles per grid cell "
-                  "(default: automatic; compressor caps dense cell arrays)\n");
+                  "(default: finest dense grid)\n");
   fprintf(stderr, "  -lr             : Specify the learning rate in PGD\n");
   fprintf(stderr, "  -iter           : Specify the max iter count in PGD\n");
   fprintf(stderr, "  -c              : Compression only\n");
@@ -105,9 +107,9 @@ void Parsing(int argc, char *argv[]) {
         parseError("Missing decompressed file path");
       decompressedFile = argv[++i];
     } else if (arg == "-D") {
-      D = std::stoi(argv[++i]);
+      D = std::stoull(argv[++i]);
     } else if (arg == "-N") {
-      N = std::stoi(argv[++i]);
+      N = std::stoull(argv[++i]);
     } else if (arg == "-f") {
       isDouble = false; // Use float type
     } else if (arg == "-d") {
@@ -130,7 +132,7 @@ void Parsing(int argc, char *argv[]) {
     } else if (arg == "-lr") {
       lr = std::stof(argv[++i]);
     } else if (arg == "-iter") {
-      max_iter = std::stoi(argv[++i]);
+      max_iter = std::stoull(argv[++i]);
     } else if (arg == "-occ") {
       if (i + 1 >= argc)
         parseError("Missing target cell occupancy");
@@ -139,6 +141,8 @@ void Parsing(int argc, char *argv[]) {
         parseError("Target cell occupancy must be positive");
     } else if (arg == "-c") {
       isEdit = false;
+    } else if (arg == "-l") {
+      isPGD = false;
     } else {
       parseError("Unknown argument");
     }
@@ -147,6 +151,9 @@ void Parsing(int argc, char *argv[]) {
   if (!originalFileSpecified && !CompressedFileSpecified) {
     parseError("At least one of original data (-i) and compressed data "
                "(-z) should be identified");
+  }
+  if (!isEdit && !isPGD) {
+    parseError("Compression mode; no need to avoid PGD");
   }
 
   // Derive D from file count; single file requires -D; -z alone also uses -D
@@ -157,6 +164,19 @@ void Parsing(int argc, char *argv[]) {
   if (D != 2 && D != 3)
     parseError(
         "Dimension must be 2 or 3: provide 2 or 3 files to -i/-e, or use -D");
+}
+
+template <typename T>
+void getRange(const T *arr, size_t N, T &minVal, T &maxVal, T &rangeVal) {
+  minVal = arr[0];
+  maxVal = arr[0];
+  for (size_t i = 0; i < N; ++i) {
+    if (arr[i] < minVal)
+      minVal = arr[i];
+    if (arr[i] > maxVal)
+      maxVal = arr[i];
+  }
+  rangeVal = maxVal - minVal;
 }
 
 template <typename T> std::string suffix(const std::string &base) {
@@ -182,17 +202,32 @@ template <typename T, OrderMode Mode> void run2D() {
     if (!baseDecompFiles.empty()) {
       // Edit only
       readCoordFiles2D<T>(baseDecompFiles, N, decomp_xx, decomp_yy);
-      reconstructEditParticles2D<T>(compressed, decomp_xx, decomp_yy, N,
-                                    dec_xi);
+      if (isPGD) {
+        reconstructEditParticles2D<T>(compressed, decomp_xx, decomp_yy, N,
+                                      dec_xi);
+      } else {
+        auto decomp_start = std::chrono::high_resolution_clock::now();
+        applyLosslessEdits2D<T>(compressed, decomp_xx, decomp_yy, N);
+        auto decomp_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> decomp_time = decomp_end - decomp_start;
+        printf("Decompression time: %f seconds\n", decomp_time.count());
+      }
     } else {
-      if (isEdit) {
+      if (isEdit && isPGD) {
         // Base and PGD edit
         decompressWithEditParticles2D<T, Mode>(compressed, decomp_xx, decomp_yy,
                                                N, dec_xi, dec_b);
       } else {
-        // Base only
+        // Base only (or base + lossless edit override)
+        auto decomp_start = std::chrono::high_resolution_clock::now();
         decompressParticles2D<T, Mode>(compressed, decomp_xx, decomp_yy, N,
                                        dec_xi, dec_b);
+        if (isEdit && !isPGD) {
+          applyLosslessEdits2D<T>(compressed, decomp_xx, decomp_yy, N);
+        }
+        auto decomp_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> decomp_time = decomp_end - decomp_start;
+        printf("Decompression time: %f seconds\n", decomp_time.count());
       }
     }
     writeRawArrayBinary(decomp_xx, N, decompressedFile + suffix<T>("xx"));
@@ -201,99 +236,53 @@ template <typename T, OrderMode Mode> void run2D() {
     delete[] decomp_yy;
   } else {
     // Compression mode
-    T *org_xx = nullptr;
-    T *org_yy = nullptr;
-    CUDA_CHECK(cudaMallocHost(&org_xx, N * sizeof(T)));
-    CUDA_CHECK(cudaMallocHost(&org_yy, N * sizeof(T)));
+    T *org_xx = new T[N];
+    T *org_yy = new T[N];
 
     readCoordFiles2D<T>(inputFiles, N, org_xx, org_yy);
-
-    T *d_org_xx, *d_org_yy;
-    CUDA_CHECK(cudaMalloc(&d_org_xx, N * sizeof(T)));
-    CUDA_CHECK(cudaMalloc(&d_org_yy, N * sizeof(T)));
-
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_org_xx, org_xx, N * sizeof(T),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_org_yy, org_yy, N * sizeof(T),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaStreamDestroy(stream));
 
     T min_x, max_x, range_x;
     T min_y, max_y, range_y;
 
-    getRange(d_org_xx, N, min_x, max_x, range_x);
-    getRange(d_org_yy, N, min_y, max_y, range_y);
+    getRange(org_xx, N, min_x, max_x, range_x);
+    getRange(org_yy, N, min_y, max_y, range_y);
 
     if (!isABS) {
       xi *= std::min(range_x, range_y);
     }
     b = d * std::sqrt(range_x * range_y / N);
 
+    CompressionResults2D<T> result;
     CompressedData<T> compressed;
-    CompressionState2D<T> state;
     if (!baseDecompFiles.empty()) {
-      // Edit-only: upload base decompressed data and run edit
-      T *base_xx = nullptr;
-      T *base_yy = nullptr;
-      CUDA_CHECK(cudaMallocHost(&base_xx, N * sizeof(T)));
-      CUDA_CHECK(cudaMallocHost(&base_yy, N * sizeof(T)));
-      readCoordFiles2D<T>(baseDecompFiles, N, base_xx, base_yy);
-      T *d_base_xx = nullptr;
-      T *d_base_yy = nullptr;
-      CUDA_CHECK(cudaMalloc(&d_base_xx, N * sizeof(T)));
-      CUDA_CHECK(cudaMalloc(&d_base_yy, N * sizeof(T)));
-      cudaStream_t stream_edit;
-      CUDA_CHECK(cudaStreamCreate(&stream_edit));
-      CUDA_CHECK(cudaMemcpyAsync(d_base_xx, base_xx, N * sizeof(T),
-                                 cudaMemcpyHostToDevice, stream_edit));
-      CUDA_CHECK(cudaMemcpyAsync(d_base_yy, base_yy, N * sizeof(T),
-                                 cudaMemcpyHostToDevice, stream_edit));
-      CUDA_CHECK(cudaStreamSynchronize(stream_edit));
-      CUDA_CHECK(cudaStreamDestroy(stream_edit));
-
-      if (xi == 0) {
-        T max_ae_xx = getMaxAbsErr(d_org_xx, d_base_xx, N);
-        T max_ae_yy = getMaxAbsErr(d_org_yy, d_base_yy, N);
-        xi = std::max(max_ae_xx, max_ae_yy);
-      }
-
-      editParticles2D<T, Mode>(d_org_xx, d_org_yy, d_base_xx, d_base_yy, min_x,
-                               range_x, min_y, range_y, N, xi, b, state,
-                               compressed);
-      destroyHashTable(state.d_editable_pts_ht);
-
-      CUDA_CHECK(cudaFreeHost(base_xx));
-      CUDA_CHECK(cudaFreeHost(base_yy));
+      // Edit only
+      result.decomp_xx = new T[N];
+      result.decomp_yy = new T[N];
+      readCoordFiles2D<T>(baseDecompFiles, N, result.decomp_xx,
+                          result.decomp_yy);
+      editParticles2D<T>(org_xx, org_yy, min_x, range_x, min_y, range_y, N, xi,
+                         b, isPGD, result, compressed);
     } else {
       if (isEdit) {
-        compressWithEditParticles2D<T, Mode>(d_org_xx, d_org_yy, min_x, range_x,
-                                             min_y, range_y, N, xi, b, state,
-                                             compressed);
+        // Compress & edit
+        compressWithEditParticles2D<T, Mode>(org_xx, org_yy, min_x, range_x,
+                                             min_y, range_y, N, xi, b, isPGD,
+                                             result, compressed);
       } else {
         // Compress only
-        compressParticles2D<T, Mode>(d_org_xx, d_org_yy, min_x, range_x, min_y,
-                                     range_y, N, xi, b, state, compressed);
-      }
-      if (!decompressedFile.empty()) {
-        ////////////////// Export Order Start //////////////////
-        int *order = new int[N];
-        getVisitOrder(state, order);
-        writeRawArrayBinary(order, N, decompressedFile + "order.dat");
-        delete[] order;
-        /////////////////// Export Order End ///////////////////
+        compressParticles2D<T, Mode>(org_xx, org_yy, min_x, range_x, min_y,
+                                     range_y, N, xi, b, result, compressed);
       }
     }
-    state.free();
-    CUDA_CHECK(cudaFree(d_org_xx));
-    CUDA_CHECK(cudaFree(d_org_yy));
-
     writeCompressedFile(compressedFile, compressed);
 
-    CUDA_CHECK(cudaFreeHost(org_xx));
-    CUDA_CHECK(cudaFreeHost(org_yy));
+    // //////////////////////// Debug, remove later ////////////////////////
+    // writeVectorBinary(result.decomp_xx, decompressedFile + suffix<T>("xx"));
+    // writeVectorBinary(result.decomp_yy, decompressedFile + suffix<T>("yy"));
+    // writeVectorBinary(result.visit_order, decompressedFile + "order.uint64");
+
+    delete[] org_xx;
+    delete[] org_yy;
   }
 }
 
@@ -311,16 +300,33 @@ template <typename T, OrderMode Mode> void run3D() {
     if (!baseDecompFiles.empty()) {
       // Edit only
       readCoordFiles3D<T>(baseDecompFiles, N, decomp_xx, decomp_yy, decomp_zz);
-      reconstructEditParticles3D<T>(compressed, decomp_xx, decomp_yy, decomp_zz,
-                                    N, dec_xi);
+      if (isPGD) {
+        reconstructEditParticles3D<T>(compressed, decomp_xx, decomp_yy,
+                                      decomp_zz, N, dec_xi);
+      } else {
+        auto decomp_start = std::chrono::high_resolution_clock::now();
+        applyLosslessEdits3D<T>(compressed, decomp_xx, decomp_yy, decomp_zz, N);
+        auto decomp_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> decomp_time = decomp_end - decomp_start;
+        printf("Decompression time: %f seconds\n", decomp_time.count());
+      }
     } else {
-      if (isEdit) {
+      if (isEdit && isPGD) {
         // Base and PGD edit
         decompressWithEditParticles3D<T, Mode>(compressed, decomp_xx, decomp_yy,
                                                decomp_zz, N, dec_xi, dec_b);
       } else {
+        // Base only (or base + lossless edit override)
+        auto decomp_start = std::chrono::high_resolution_clock::now();
         decompressParticles3D<T, Mode>(compressed, decomp_xx, decomp_yy,
                                        decomp_zz, N, dec_xi, dec_b);
+        if (isEdit && !isPGD) {
+          applyLosslessEdits3D<T>(compressed, decomp_xx, decomp_yy, decomp_zz,
+                                  N);
+        }
+        auto decomp_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> decomp_time = decomp_end - decomp_start;
+        printf("Decompression time: %f seconds\n", decomp_time.count());
       }
     }
     writeRawArrayBinary(decomp_xx, N, decompressedFile + suffix<T>("xx"));
@@ -331,131 +337,60 @@ template <typename T, OrderMode Mode> void run3D() {
     delete[] decomp_zz;
   } else {
     // Compression mode
-    T *org_xx = nullptr;
-    T *org_yy = nullptr;
-    T *org_zz = nullptr;
-    CUDA_CHECK(cudaMallocHost(&org_xx, N * sizeof(T)));
-    CUDA_CHECK(cudaMallocHost(&org_yy, N * sizeof(T)));
-    CUDA_CHECK(cudaMallocHost(&org_zz, N * sizeof(T)));
+    T *org_xx = new T[N];
+    T *org_yy = new T[N];
+    T *org_zz = new T[N];
 
     readCoordFiles3D<T>(inputFiles, N, org_xx, org_yy, org_zz);
-
-    T *d_org_xx, *d_org_yy, *d_org_zz;
-    CUDA_CHECK(cudaMalloc(&d_org_xx, N * sizeof(T)));
-    CUDA_CHECK(cudaMalloc(&d_org_yy, N * sizeof(T)));
-    CUDA_CHECK(cudaMalloc(&d_org_zz, N * sizeof(T)));
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_org_xx, org_xx, N * sizeof(T),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_org_yy, org_yy, N * sizeof(T),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_org_zz, org_zz, N * sizeof(T),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaStreamDestroy(stream));
 
     T min_x, max_x, range_x;
     T min_y, max_y, range_y;
     T min_z, max_z, range_z;
 
-    getRange(d_org_xx, N, min_x, max_x, range_x);
-    getRange(d_org_yy, N, min_y, max_y, range_y);
-    getRange(d_org_zz, N, min_z, max_z, range_z);
+    getRange(org_xx, N, min_x, max_x, range_x);
+    getRange(org_yy, N, min_y, max_y, range_y);
+    getRange(org_zz, N, min_z, max_z, range_z);
 
     if (!isABS) {
       xi *= std::min({range_x, range_y, range_z});
     }
     b = d * std::cbrt(range_x * range_y * range_z / N);
 
+    CompressionResults3D<T> result;
     CompressedData<T> compressed;
-    CompressionState3D<T> state;
     if (!baseDecompFiles.empty()) {
-      // Edit-only
-      T *base_xx = nullptr;
-      T *base_yy = nullptr;
-      T *base_zz = nullptr;
-      CUDA_CHECK(cudaMallocHost(&base_xx, N * sizeof(T)));
-      CUDA_CHECK(cudaMallocHost(&base_yy, N * sizeof(T)));
-      CUDA_CHECK(cudaMallocHost(&base_zz, N * sizeof(T)));
-      readCoordFiles3D<T>(baseDecompFiles, N, base_xx, base_yy, base_zz);
-      T *d_base_xx = nullptr;
-      T *d_base_yy = nullptr;
-      T *d_base_zz = nullptr;
-      CUDA_CHECK(cudaMalloc(&d_base_xx, N * sizeof(T)));
-      CUDA_CHECK(cudaMalloc(&d_base_yy, N * sizeof(T)));
-      CUDA_CHECK(cudaMalloc(&d_base_zz, N * sizeof(T)));
-      cudaStream_t stream_edit;
-      CUDA_CHECK(cudaStreamCreate(&stream_edit));
-      CUDA_CHECK(cudaMemcpyAsync(d_base_xx, base_xx, N * sizeof(T),
-                                 cudaMemcpyHostToDevice, stream_edit));
-      CUDA_CHECK(cudaMemcpyAsync(d_base_yy, base_yy, N * sizeof(T),
-                                 cudaMemcpyHostToDevice, stream_edit));
-      CUDA_CHECK(cudaMemcpyAsync(d_base_zz, base_zz, N * sizeof(T),
-                                 cudaMemcpyHostToDevice, stream_edit));
-      CUDA_CHECK(cudaStreamSynchronize(stream_edit));
-      CUDA_CHECK(cudaStreamDestroy(stream_edit));
-
-      if (xi == 0) {
-        T max_ae_xx = getMaxAbsErr(d_org_xx, d_base_xx, N);
-        T max_ae_yy = getMaxAbsErr(d_org_yy, d_base_yy, N);
-        xi = std::max(max_ae_xx, max_ae_yy);
-        T max_ae_zz = getMaxAbsErr(d_org_zz, d_base_zz, N);
-        xi = std::max(xi, static_cast<float>(max_ae_zz));
-      }
-
-      editParticles3D<T, Mode>(
-          d_org_xx, d_org_yy, d_org_zz, d_base_xx, d_base_yy, d_base_zz, min_x,
-          range_x, min_y, range_y, min_z, range_z, N, xi, b, state, compressed);
-      destroyHashTable(state.d_editable_pts_ht);
-
-      CUDA_CHECK(cudaFreeHost(base_xx));
-      CUDA_CHECK(cudaFreeHost(base_yy));
-      CUDA_CHECK(cudaFreeHost(base_zz));
+      // Edit only
+      result.decomp_xx = new T[N];
+      result.decomp_yy = new T[N];
+      result.decomp_zz = new T[N];
+      readCoordFiles3D<T>(baseDecompFiles, N, result.decomp_xx,
+                          result.decomp_yy, result.decomp_zz);
+      editParticles3D<T>(org_xx, org_yy, org_zz, min_x, range_x, min_y, range_y,
+                         min_z, range_z, N, xi, b, isPGD, result, compressed);
     } else {
       if (isEdit) {
+        // Compress & edit
         compressWithEditParticles3D<T, Mode>(
-            d_org_xx, d_org_yy, d_org_zz, min_x, range_x, min_y, range_y, min_z,
-            range_z, N, xi, b, state, compressed);
+            org_xx, org_yy, org_zz, min_x, range_x, min_y, range_y, min_z,
+            range_z, N, xi, b, isPGD, result, compressed);
       } else {
         // Compress only
-        compressParticles3D<T, Mode>(d_org_xx, d_org_yy, d_org_zz, min_x,
-                                     range_x, min_y, range_y, min_z, range_z, N,
-                                     xi, b, state, compressed);
+        compressParticles3D<T, Mode>(org_xx, org_yy, org_zz, min_x, range_x,
+                                     min_y, range_y, min_z, range_z, N, xi, b,
+                                     result, compressed);
       }
     }
-
-    if (!decompressedFile.empty()) {
-      ////////////////// Export Decomp Start //////////////////
-      T *decomp_xx = new T[N];
-      T *decomp_yy = new T[N];
-      T *decomp_zz = new T[N];
-      getDecompressedCoords3D(state, decomp_xx, decomp_yy, decomp_zz);
-      writeRawArrayBinary(decomp_xx, N, decompressedFile + "xx.out");
-      writeRawArrayBinary(decomp_yy, N, decompressedFile + "yy.out");
-      writeRawArrayBinary(decomp_zz, N, decompressedFile + "zz.out");
-      delete[] decomp_xx;
-      delete[] decomp_yy;
-      delete[] decomp_zz;
-      /////////////////// Export Decomp End ///////////////////
-    }
-
-    // ////////////////// Export Order Start //////////////////
-    // int *order = new int[N];
-    // getVisitOrder(state, order);
-    // writeRawArrayBinary(order, N, decompressedFile + "order.dat");
-    // /////////////////// Export Order End ///////////////////
-
-    state.free();
-    CUDA_CHECK(cudaFree(d_org_xx));
-    CUDA_CHECK(cudaFree(d_org_yy));
-    CUDA_CHECK(cudaFree(d_org_zz));
-
     writeCompressedFile(compressedFile, compressed);
 
-    CUDA_CHECK(cudaFreeHost(org_xx));
-    CUDA_CHECK(cudaFreeHost(org_yy));
-    CUDA_CHECK(cudaFreeHost(org_zz));
+    // //////////////////////// Debug, remove later ////////////////////////
+    // writeVectorBinary(result.decomp_xx, decompressedFile + suffix<T>("xx"));
+    // writeVectorBinary(result.decomp_yy, decompressedFile + suffix<T>("yy"));
+    // writeVectorBinary(result.decomp_zz, decompressedFile + suffix<T>("zz"));
+    // writeVectorBinary(result.visit_order, decompressedFile + "order.uint64");
+
+    delete[] org_xx;
+    delete[] org_yy;
+    delete[] org_zz;
   }
 }
 
@@ -491,6 +426,4 @@ int main(int argc, char *argv[]) {
       }
     }
   }
-
-  return 0;
 }

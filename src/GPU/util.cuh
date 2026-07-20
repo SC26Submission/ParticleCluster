@@ -2,6 +2,7 @@
 
 #include "config.cuh"
 #include <cstdio>
+#include <cstdlib>
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
 #include <limits>
@@ -209,15 +210,22 @@ __global__ void computeParticleCellIndices3D_kernel(
   }
 }
 
-/**
- * Partition 2D particles into grid cells and get sorted indices
- * Allocates d_cell_start and d_cell_pts_sorted on GPU (caller must free)
- */
+// Partition particles into grid cells and get sorted indices (2D)
 template <typename T>
 void particlePartition2D(const T *d_org_xx, const T *d_org_yy, T min_x, T min_y,
                          T grid_len, int grid_dim_x, int grid_dim_y, int N,
                          int **d_cell_start_out, int **d_cell_pts_sorted_out) {
-  int num_cells = grid_dim_x * grid_dim_y;
+  long long num_cells_ll =
+      static_cast<long long>(grid_dim_x) * static_cast<long long>(grid_dim_y);
+  if (num_cells_ll <= 0 ||
+      num_cells_ll > static_cast<long long>(std::numeric_limits<int>::max())) {
+    std::fprintf(stderr,
+                 "particlePartition2D cell count %lld exceeds int range; "
+                 "increase grid length or coarsen the grid\n",
+                 num_cells_ll);
+    std::exit(EXIT_FAILURE);
+  }
+  int num_cells = static_cast<int>(num_cells_ll);
 
   int *d_nums_cell_pts;
   int *d_cell_pts_sorted, *d_cell_ids, *d_cell_start, *d_cell_offsets;
@@ -234,7 +242,7 @@ void particlePartition2D(const T *d_org_xx, const T *d_org_yy, T min_x, T min_y,
   computeParticleCellIndices2D_kernel<<<num_blocks, num_threads>>>(
       d_org_xx, d_org_yy, d_cell_ids, d_nums_cell_pts, min_x, min_y, grid_len,
       grid_dim_x, grid_dim_y, N);
-  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaPeekAtLastError());
 
   cub::DeviceScan::ExclusiveSum(d_tmp_storage, tmp_storage_bytes,
                                 d_nums_cell_pts, d_cell_start, num_cells);
@@ -242,33 +250,43 @@ void particlePartition2D(const T *d_org_xx, const T *d_org_yy, T min_x, T min_y,
   cub::DeviceScan::ExclusiveSum(d_tmp_storage, tmp_storage_bytes,
                                 d_nums_cell_pts, d_cell_start, num_cells);
 
+  // Free dead variables to save memory
+  CUDA_CHECK(cudaFree(d_nums_cell_pts));
+  CUDA_CHECK(cudaFree(d_tmp_storage));
+
   CUDA_CHECK(cudaMemcpy(d_cell_offsets, d_cell_start, num_cells * sizeof(int),
                         cudaMemcpyDeviceToDevice));
 
   fillCellParticles_kernel<<<num_blocks, num_threads>>>(
       d_cell_ids, d_cell_offsets, d_cell_pts_sorted, N);
-  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaPeekAtLastError());
 
   CUDA_CHECK(cudaFree(d_cell_ids));
-  CUDA_CHECK(cudaFree(d_nums_cell_pts));
   CUDA_CHECK(cudaFree(d_cell_offsets));
-  CUDA_CHECK(cudaFree(d_tmp_storage));
 
   *d_cell_start_out = d_cell_start;
   *d_cell_pts_sorted_out = d_cell_pts_sorted;
 }
 
-/**
- * Partition 3D particles into grid cells and get sorted indices
- * Allocates d_cell_start and d_cell_pts_sorted on GPU (caller must free)
- */
+// Partition particles into grid cells and get sorted indices (3D)
 template <typename T>
 void particlePartition3D(const T *d_org_xx, const T *d_org_yy,
                          const T *d_org_zz, T min_x, T min_y, T min_z,
                          T grid_len, int grid_dim_x, int grid_dim_y,
                          int grid_dim_z, int N, int **d_cell_start_out,
                          int **d_cell_pts_sorted_out) {
-  int num_cells = grid_dim_x * grid_dim_y * grid_dim_z;
+  long long num_cells_ll = static_cast<long long>(grid_dim_x) *
+                           static_cast<long long>(grid_dim_y) *
+                           static_cast<long long>(grid_dim_z);
+  if (num_cells_ll <= 0 ||
+      num_cells_ll > static_cast<long long>(std::numeric_limits<int>::max())) {
+    std::fprintf(stderr,
+                 "particlePartition3D cell count %lld exceeds int range; "
+                 "increase grid length or coarsen the grid\n",
+                 num_cells_ll);
+    std::exit(EXIT_FAILURE);
+  }
+  int num_cells = static_cast<int>(num_cells_ll);
 
   int *d_nums_cell_pts;
   int *d_cell_pts_sorted, *d_cell_ids, *d_cell_start, *d_cell_offsets;
@@ -285,7 +303,7 @@ void particlePartition3D(const T *d_org_xx, const T *d_org_yy,
   computeParticleCellIndices3D_kernel<<<num_blocks, num_threads>>>(
       d_org_xx, d_org_yy, d_org_zz, d_cell_ids, d_nums_cell_pts, min_x, min_y,
       min_z, grid_len, grid_dim_x, grid_dim_y, grid_dim_z, N);
-  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaPeekAtLastError());
 
   cub::DeviceScan::ExclusiveSum(d_tmp_storage, tmp_storage_bytes,
                                 d_nums_cell_pts, d_cell_start, num_cells);
@@ -293,17 +311,19 @@ void particlePartition3D(const T *d_org_xx, const T *d_org_yy,
   cub::DeviceScan::ExclusiveSum(d_tmp_storage, tmp_storage_bytes,
                                 d_nums_cell_pts, d_cell_start, num_cells);
 
+  // Free dead variables to save memory
+  CUDA_CHECK(cudaFree(d_nums_cell_pts));
+  CUDA_CHECK(cudaFree(d_tmp_storage));
+
   CUDA_CHECK(cudaMemcpy(d_cell_offsets, d_cell_start, num_cells * sizeof(int),
                         cudaMemcpyDeviceToDevice));
 
   fillCellParticles_kernel<<<num_blocks, num_threads>>>(
       d_cell_ids, d_cell_offsets, d_cell_pts_sorted, N);
-  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaPeekAtLastError());
 
   CUDA_CHECK(cudaFree(d_cell_ids));
-  CUDA_CHECK(cudaFree(d_nums_cell_pts));
   CUDA_CHECK(cudaFree(d_cell_offsets));
-  CUDA_CHECK(cudaFree(d_tmp_storage));
 
   *d_cell_start_out = d_cell_start;
   *d_cell_pts_sorted_out = d_cell_pts_sorted;

@@ -94,7 +94,6 @@ void calculateStatistics2D(const T *d_org_xx, const T *d_org_yy,
   int num_blocks = (N + num_threads - 1) / num_threads;
   difference_kernel<T><<<num_blocks, num_threads>>>(d_org_xx, d_err_xx, N);
   difference_kernel<T><<<num_blocks, num_threads>>>(d_org_yy, d_err_yy, N);
-  CUDA_CHECK(cudaDeviceSynchronize());
 
   T mae_x = findMaxAbs(d_err_xx, N);
   T mae_y = findMaxAbs(d_err_yy, N);
@@ -134,7 +133,6 @@ void calculateStatistics3D(const T *d_org_xx, const T *d_org_yy,
   difference_kernel<T><<<num_blocks, num_threads>>>(d_org_xx, d_err_xx, N);
   difference_kernel<T><<<num_blocks, num_threads>>>(d_org_yy, d_err_yy, N);
   difference_kernel<T><<<num_blocks, num_threads>>>(d_org_zz, d_err_zz, N);
-  CUDA_CHECK(cudaDeviceSynchronize());
 
   T mae_x = findMaxAbs(d_err_xx, N);
   T mae_y = findMaxAbs(d_err_yy, N);

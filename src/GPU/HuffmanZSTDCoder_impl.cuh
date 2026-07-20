@@ -408,7 +408,6 @@ HuffmanZstdCompressor<T>::compress(const T *d_data, size_t N, int zstd_level,
                                      d_lengths_lut, num_unique, d_codes,
                                      d_lengths, N);
   CHECK_CUDA(cudaGetLastError());
-  CHECK_CUDA(cudaDeviceSynchronize());
 
   if (verbose) {
     cudaEventRecord(stop);
@@ -461,7 +460,6 @@ HuffmanZstdCompressor<T>::compress(const T *d_data, size_t N, int zstd_level,
   packBytesAligned<<<grid, block>>>(d_codes, d_lengths, d_bit_positions,
                                     d_packed, N);
   CHECK_CUDA(cudaGetLastError());
-  CHECK_CUDA(cudaDeviceSynchronize());
 
   if (verbose) {
     cudaEventRecord(stop);
